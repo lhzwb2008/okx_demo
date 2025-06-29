@@ -1,21 +1,17 @@
-import pandas as pd
-import numpy as np
+import pandas as pd # pyright: ignore
+import numpy as np# pyright: ignore
 from math import floor
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt# pyright: ignore
 from datetime import datetime, time, timedelta, date
 import random
 import os
-from plot_trading_day import plot_trading_day
+from plot_trading_day import plot_trading_day# pyright: ignore
 
-def calculate_vwap(prices, volumes):
-    """
-    计算VWAP (成交量加权平均价格)
-    """
-    return sum(p * v for p, v in zip(prices, volumes)) / sum(volumes) if sum(volumes) > 0 else prices[-1]
+
 
 def simulate_day(day_df, prev_close, allowed_times, position_size, config):
     """
-    模拟单日交易，使用噪声空间策略 + VWAP
+    模拟单日交易，使用噪声空间策略
     
     参数:
         day_df: 包含日内数据的DataFrame
@@ -37,44 +33,20 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config):
     trades = []
     positions_opened_today = 0  # 今日开仓计数器
     
-    # 存储用于计算VWAP的数据
-    prices = []
-    volumes = []
-    
     # 调试时间点标记，确保只打印一次
     debug_printed = False
     
     for idx, row in day_df.iterrows():
         current_time = row['Time']
         price = row['Close']
-        volume = row['Volume']
         upper = row['UpperBound']
         lower = row['LowerBound']
         sigma = row.get('sigma', 0)
         
-        # # 调试特定时间点
-        # if debug_time is not None and current_time >= debug_time and not debug_printed:
-        #     date_str = row['DateTime'].strftime('%Y-%m-%d')
-        #     print(f"\n===== 调试信息 [{date_str} {current_time}] =====")
-        #     print(f"价格: {price:.6f}")
-        #     print(f"上边界: {upper:.6f}")
-        #     print(f"下边界: {lower:.6f}")
-        #     print(f"Sigma值: {sigma:.6f}")
-        #     print(f"VWAP: {calculate_vwap(prices, volumes):.6f}")
-        #     print("=====================================\n")
-        #     debug_printed = True  # 确保只打印一次
-        
-        # 更新VWAP计算数据
-        prices.append(price)
-        volumes.append(volume)
-        
-        # 计算当前VWAP
-        vwap = calculate_vwap(prices, volumes)
-        
         # 在允许时间内的入场信号
         if position == 0 and current_time in allowed_times and positions_opened_today < max_positions_per_day:
-            # 检查潜在多头入场 - 加入VWAP条件
-            if price > upper and price > vwap:
+            # 检查潜在多头入场
+            if price > upper:
                 # 打印边界计算详情（如果需要）
                 if print_details:
                     date_str = row['DateTime'].strftime('%Y-%m-%d')
@@ -84,7 +56,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config):
                     day_open = row.get('day_open', 0)
                     
                     print(f"\n交易点位详情 [{date_str} {current_time}] - 多头入场:")
-                    print(f"  价格: {price:.2f} > 上边界: {upper:.2f} 且 > VWAP: {vwap:.2f}")
+                    print(f"  价格: {price:.2f} > 上边界: {upper:.2f}")
                     print(f"  边界计算详情:")
                     print(f"    - 日开盘价: {day_open:.2f}, 前日收盘价: {prev_close:.2f}")
                     print(f"    - 上边界参考价: max({day_open:.2f}, {prev_close:.2f}) = {upper_ref:.2f}")
@@ -98,11 +70,11 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config):
                 entry_price = price
                 trade_entry_time = row['DateTime']
                 positions_opened_today += 1  # 增加开仓计数器
-                # 初始止损设为上边界和VWAP的最大值
-                trailing_stop = max(upper, vwap)
+                # 初始止损设为上边界
+                trailing_stop = upper
                     
-            # 检查潜在空头入场 - 加入VWAP条件
-            if price < lower and price < vwap:
+            # 检查潜在空头入场
+            if price < lower:
                 # 打印边界计算详情（如果需要）
                 if print_details:
                     date_str = row['DateTime'].strftime('%Y-%m-%d')
@@ -112,7 +84,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config):
                     day_open = row.get('day_open', 0)
                     
                     print(f"\n交易点位详情 [{date_str} {current_time}] - 空头入场:")
-                    print(f"  价格: {price:.2f} < 下边界: {lower:.2f} 且 < VWAP: {vwap:.2f}")
+                    print(f"  价格: {price:.2f} < 下边界: {lower:.2f}")
                     print(f"  边界计算详情:")
                     print(f"    - 日开盘价: {day_open:.2f}, 前日收盘价: {prev_close:.2f}")
                     print(f"    - 上边界参考价: max({day_open:.2f}, {prev_close:.2f}) = {upper_ref:.2f}")
@@ -126,14 +98,14 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config):
                 entry_price = price
                 trade_entry_time = row['DateTime']
                 positions_opened_today += 1  # 增加开仓计数器
-                # 初始止损设为下边界和VWAP的最小值
-                trailing_stop = min(lower, vwap)
+                # 初始止损设为下边界
+                trailing_stop = lower
         
         # 更新止损并检查出场信号
         if position != 0:
             if position == 1:  # 多头仓位
-                # 计算当前时刻的止损水平（使用上边界和VWAP的最大值）
-                trailing_stop = max(upper, vwap)
+                # 计算当前时刻的止损水平（使用上边界）
+                trailing_stop = upper
                 
                 # 如果价格跌破当前止损，则平仓
                 exit_condition = price < trailing_stop
@@ -145,7 +117,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config):
                         date_str = row['DateTime'].strftime('%Y-%m-%d')
                         print(f"\n交易点位详情 [{date_str} {current_time}] - 多头出场:")
                         print(f"  价格: {price:.2f} < 当前止损: {trailing_stop:.2f}")
-                        print(f"  止损计算: max(上边界={upper:.2f}, VWAP={vwap:.2f}) = {trailing_stop:.2f}")
+                        print(f"  止损计算: 上边界={upper:.2f}")
                         print(f"  买入价: {entry_price:.2f}, 卖出价: {price:.2f}, 股数: {position_size}")
                     
                     # 平仓多头
@@ -171,8 +143,8 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config):
                     trailing_stop = np.nan
                     
             elif position == -1:  # 空头仓位
-                # 计算当前时刻的止损水平（使用下边界和VWAP的最小值）
-                trailing_stop = min(lower, vwap)
+                # 计算当前时刻的止损水平（使用下边界）
+                trailing_stop = lower
                 
                 # 如果价格涨破当前止损，则平仓
                 exit_condition = price > trailing_stop
@@ -184,7 +156,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config):
                         date_str = row['DateTime'].strftime('%Y-%m-%d')
                         print(f"\n交易点位详情 [{date_str} {current_time}] - 空头出场:")
                         print(f"  价格: {price:.2f} > 当前止损: {trailing_stop:.2f}")
-                        print(f"  止损计算: min(下边界={lower:.2f}, VWAP={vwap:.2f}) = {trailing_stop:.2f}")
+                        print(f"  止损计算: 下边界={lower:.2f}")
                         print(f"  卖出价: {entry_price:.2f}, 买入价: {price:.2f}, 股数: {position_size}")
                     
                     # 平仓空头
@@ -325,7 +297,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config):
 
 def run_backtest(config):
     """
-    运行回测 - 噪声空间策略 + VWAP
+    运行回测 - 噪声空间策略
     
     参数:
         config: 配置字典，包含所有回测参数
@@ -371,6 +343,10 @@ def run_backtest(config):
     price_df['Date'] = price_df['DateTime'].dt.date
     price_df['Time'] = price_df['DateTime'].dt.strftime('%H:%M')
     
+    # 如果没有Volume列，添加默认Volume列
+    if 'Volume' not in price_df.columns:
+        price_df['Volume'] = 1.0  # 为BTC数据添加默认成交量
+    
     # 按日期范围过滤数据（如果指定）
     if start_date is not None:
         price_df = price_df[price_df['Date'] >= start_date]
@@ -382,17 +358,51 @@ def run_backtest(config):
     
     # 检查DayOpen和DayClose列是否存在，如果不存在则创建
     if 'DayOpen' not in price_df.columns or 'DayClose' not in price_df.columns:
-        # 对于每一天，获取第一行（9:30 AM开盘价）
-        opening_prices = price_df.groupby('Date').first().reset_index()
-        opening_prices = opening_prices[['Date', 'Open']].rename(columns={'Open': 'DayOpen'})
-
-        # 对于每一天，获取最后一行（4:00 PM收盘价）
-        closing_prices = price_df.groupby('Date').last().reset_index()
-        closing_prices = closing_prices[['Date', 'Close']].rename(columns={'Close': 'DayClose'})
-
+        # 对于BTC数据，使用特定时间点
+        # 今天开盘价：取21:30分K线的开盘价
+        opening_prices = []
+        closing_prices = []
+        
+        for date in price_df['Date'].unique():
+            day_data = price_df[price_df['Date'] == date]
+            
+            # 寻找21:30的开盘价
+            open_time_data = day_data[day_data['Time'] == '21:30']
+            if not open_time_data.empty:
+                day_open = open_time_data.iloc[0]['Open']
+            else:
+                # 如果没有21:30的数据，使用当天第一个数据点的开盘价
+                day_open = day_data.iloc[0]['Open']
+            
+            opening_prices.append({'Date': date, 'DayOpen': day_open})
+            
+            # 昨日收盘价：取昨天16:00分K线的收盘价
+            # 先找前一天的数据
+            prev_date = pd.to_datetime(date) - pd.Timedelta(days=1)
+            prev_date = prev_date.date()
+            prev_day_data = price_df[price_df['Date'] == prev_date]
+            
+            if not prev_day_data.empty:
+                # 寻找16:00的收盘价
+                close_time_data = prev_day_data[prev_day_data['Time'] == '16:00']
+                if not close_time_data.empty:
+                    day_close = close_time_data.iloc[0]['Close']
+                else:
+                    # 如果没有16:00的数据，使用前一天最后一个数据点的收盘价
+                    day_close = prev_day_data.iloc[-1]['Close']
+            else:
+                # 如果没有前一天数据，使用当天开盘价
+                day_close = day_open
+            
+            closing_prices.append({'Date': date, 'DayClose': day_close})
+        
+        # 转换为DataFrame并合并
+        opening_prices_df = pd.DataFrame(opening_prices)
+        closing_prices_df = pd.DataFrame(closing_prices)
+        
         # 将开盘价和收盘价合并回主DataFrame
-        price_df = pd.merge(price_df, opening_prices, on='Date', how='left')
-        price_df = pd.merge(price_df, closing_prices, on='Date', how='left')
+        price_df = pd.merge(price_df, opening_prices_df, on='Date', how='left')
+        price_df = pd.merge(price_df, closing_prices_df, on='Date', how='left')
     
     # 使用筛选后数据的DayOpen和DayClose
     # 这些代表9:30 AM开盘价和4:00 PM收盘价
@@ -455,13 +465,26 @@ def run_backtest(config):
     # 检查每个交易日是否有足够的sigma数据
     # 创建一个标记，记录哪些日期的sigma数据不完整
     incomplete_sigma_dates = set()
+    print(f"检查{len(price_df['Date'].unique())}个日期的sigma数据...")
+    print(f"Pivot表形状: {pivot.shape}")
+    print(f"Sigma表形状: {sigma.shape}")
+    print(f"Sigma中NaN的数量: {sigma['sigma'].isna().sum()}")
+    
     for date in price_df['Date'].unique():
         day_data = price_df[price_df['Date'] == date]
-        if day_data['sigma'].isna().any():
+        na_count = day_data['sigma'].isna().sum()
+        total_count = len(day_data)
+        if na_count > 0:
+            print(f"日期 {date} 有 {na_count}/{total_count} 个缺失的sigma值")
             incomplete_sigma_dates.add(date)
+        else:
+            print(f"日期 {date} sigma数据完整 ({total_count}条)")
     
     # 移除sigma数据不完整的日期
     price_df = price_df[~price_df['Date'].isin(incomplete_sigma_dates)]
+    
+    print(f"处理后剩余数据: {len(price_df)} 条")
+    print(f"剩余日期数: {len(price_df['Date'].unique())}")
     
     # 确保所有剩余的sigma值都有有效数据
     if price_df['sigma'].isna().any():
@@ -700,8 +723,12 @@ def run_backtest(config):
     
     # 创建每日结果DataFrame
     daily_df = pd.DataFrame(daily_results)
-    daily_df['Date'] = pd.to_datetime(daily_df['Date'])
-    daily_df.set_index('Date', inplace=True)
+    if len(daily_df) > 0:
+        daily_df['Date'] = pd.to_datetime(daily_df['Date'])
+        daily_df.set_index('Date', inplace=True)
+    else:
+        print("警告: 没有有效的交易日数据")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
     
     # 创建买入持有DataFrame
     buy_hold_df = pd.DataFrame(buy_hold_data)
@@ -794,7 +821,7 @@ def run_backtest(config):
     # 打印简化的性能指标
     print(f"\n策略性能指标:")
     leverage_text = f" (杠杆{leverage}x)" if leverage != 1 else ""
-    strategy_name = f"{ticker} Curr.Band + VWAP{leverage_text}"
+    strategy_name = f"{ticker} 噪声空间策略{leverage_text}"
     print(f"策略: {strategy_name}")
     
     # 创建表格格式对比策略与买入持有的指标
@@ -1199,28 +1226,27 @@ def plot_specific_days(config, dates_to_plot):
 if __name__ == "__main__":  
     # 创建配置字典
     config = {
-        # 'data_path': 'qqq_market_hours_with_indicators.csv',
-        'data_path': 'qqq_longport.csv',
-        'ticker': 'QQQ',
-        'initial_capital': 13000,
+        'data_path': 'okx_btc_1m.csv',
+        'ticker': 'BTC',
+        'initial_capital': 100000,
         'lookback_days':1,
-        'start_date': date(2024, 1, 1),
-        'end_date': date(2025, 1, 1),
+        'start_date': date(2025, 6, 1),
+        'end_date': date(2025, 6, 29),
         'check_interval_minutes': 15 ,
-        'transaction_fee_per_share': 0.008166,
-        # 'transaction_fee_per_share': 0.013166,
+        'transaction_fee_per_share': 0,
+        # 'transaction_fee_per_share': 0.008166,
+
 
         'trading_start_time': (9, 40),
         'trading_end_time': (15, 45),
         'max_positions_per_day': 10,
-        # 'random_plots': 3,
-        # 'plots_dir': 'trading_plots',
-        'print_daily_trades': False,
+        'random_plots': 2,
+        'plots_dir': 'trading_plots',
+        'print_daily_trades': True,
         'print_trade_details': False,
-        # 'debug_time': '12:46',
         'K1': 1,  # 上边界sigma乘数
         'K2': 1,  # 下边界sigma乘数
-        'leverage': 5  # 资金杠杆倍数，默认为1
+        'leverage': 3  # 资金杠杆倍数，默认为1
     }
     
     # 运行回测
