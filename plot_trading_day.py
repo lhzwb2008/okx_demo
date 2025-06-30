@@ -1,6 +1,6 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd# pyright: ignore
+import numpy as np# pyright: ignore
+import matplotlib.pyplot as plt# pyright: ignore
 from datetime import datetime, date
 import os
 
