@@ -16,7 +16,7 @@ class BTCMicroTrendConfig:
     def __init__(self):
         # === 基础配置 ===
         self.data_path = 'btc_1m.csv'
-        self.initial_capital = 10000  # 初始资金（USDT）
+        self.initial_capital = 50000  # 初始资金（USDT）- 使用成功版本的参数
         
         # === 数据配置 ===
         self.data_limit = 30000  # 使用数据条数
@@ -445,13 +445,17 @@ def get_parameter_suggestions():
 if __name__ == "__main__":
     print(get_parameter_suggestions())
     
-    # 使用默认配置（与原optimized版本相同）
+    # 使用默认配置（应该能复现之前8.59%的成功结果）
     config = BTCMicroTrendConfig()
     
-    # 你可以在这里修改参数，例如：
-    # config.initial_capital = 50000
-    # config.lookback = 15
-    # config.buy_threshold_percentile = 80
+    print(f"\n当前配置:")
+    print(f"  - 初始资金: ${config.initial_capital:,}")
+    print(f"  - 数据量: {config.data_limit:,} 条")
+    print(f"  - 观察窗口: {config.lookback} 分钟")
+    print(f"  - 预测时间: {config.predict_ahead} 分钟")
+    print(f"  - 买入阈值: {config.buy_threshold_percentile}%")
+    print(f"  - 卖出阈值: {config.sell_threshold_percentile}%")
+    print(f"  - 随机森林参数: n_estimators={config.n_estimators}, max_depth={config.max_depth}")
     
     # 运行回测
     backtest = BTCMicroTrendBacktest(config)
