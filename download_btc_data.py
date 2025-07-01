@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 BTC历史数据下载和处理脚本
-从Binance Vision下载2024年1月1日至今的BTCUSDT 1分钟数据
-并转换为指定格式
+从Binance Vision下载BTCUSDT 1分钟数据并转换为指定格式
+支持自定义时间范围配置
 """
 
 import os
@@ -12,29 +12,51 @@ import zipfile
 import pandas as pd# pyright: ignore
 from datetime import datetime, date, timedelta
 import calendar
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 import time
 import argparse
 
+# ==================== 配置区域 ====================
+# 您可以在这里修改下载的时间范围
+CONFIG = {
+    # 数据下载时间范围配置
+    'START_DATE': '2024-01-01',  # 开始日期，格式：YYYY-MM-DD
+    'END_DATE': '2025-05-31',    # 结束日期，格式：YYYY-MM-DD
+    
+    # 输出文件配置
+    'OUTPUT_FILENAME': 'btc_1m.csv',  # 输出文件名（直接在当前目录）
+    
+    # 下载配置
+    'SYMBOL': 'BTCUSDT',              # 交易对
+    'INTERVAL': '1m',                 # 时间间隔
+    'DELAY_BETWEEN_DOWNLOADS': 0.5,   # 下载间隔（秒）
+}
+# ================================================
+
 class BTCDataDownloader:
-    def __init__(self, output_dir: str = "btc_data"):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
         初始化下载器
         
         Args:
-            output_dir: 输出目录
+            config: 配置字典，如果为None则使用全局CONFIG
         """
+        if config is None:
+            config = CONFIG
+            
         self.base_url = "https://data.binance.vision/data/spot"
-        self.symbol = "BTCUSDT"
-        self.interval = "1m"
-        self.output_dir = output_dir
-        self.temp_dir = os.path.join(output_dir, "temp")
+        self.symbol = config['SYMBOL']
+        self.interval = config['INTERVAL']
+        self.output_filename = config['OUTPUT_FILENAME']
+        self.delay = config['DELAY_BETWEEN_DOWNLOADS']
+        self.temp_dir = "temp"
         
-        # 创建目录
-        os.makedirs(self.output_dir, exist_ok=True)
+        # 创建临时目录
         os.makedirs(self.temp_dir, exist_ok=True)
         
-        print(f"输出目录: {self.output_dir}")
+        print(f"交易对: {self.symbol}")
+        print(f"时间间隔: {self.interval}")
+        print(f"输出文件: {self.output_filename}")
         print(f"临时目录: {self.temp_dir}")
     
     def get_date_ranges(self, start_date: date, end_date: date) -> List[Tuple[str, str]]:
@@ -166,7 +188,17 @@ class BTCDataDownloader:
             return df
         
         # 转换时间戳为datetime格式
-        df['DateTime'] = pd.to_datetime(df['Open_time'], unit='ms')
+        # 注意：从2025年1月1日开始，Binance使用微秒时间戳
+        try:
+            # 先尝试毫秒格式
+            df['DateTime'] = pd.to_datetime(df['Open_time'], unit='ms')
+        except:
+            try:
+                # 如果失败，尝试微秒格式
+                df['DateTime'] = pd.to_datetime(df['Open_time'], unit='us')
+            except:
+                # 如果还是失败，尝试纳秒格式或直接转换
+                df['DateTime'] = pd.to_datetime(df['Open_time'], unit='ns')
         
         # 选择需要的列并重命名
         result_df = df[['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
@@ -204,26 +236,26 @@ class BTCDataDownloader:
             # 下载文件
             zip_filepath = self.download_file(period_type, date_str)
             
-            if zip_filepath and os.path.exists(zip_filepath):
+            if zip_filepath:
                 # 处理文件
                 df = self.extract_and_process_file(zip_filepath)
                 
                 if not df.empty:
                     # 转换格式
-                    converted_df = self.convert_to_target_format(df)
-                    all_dataframes.append(converted_df)
+                    formatted_df = self.convert_to_target_format(df)
+                    all_dataframes.append(formatted_df)
                     successful_downloads += 1
                 
-                # 删除临时ZIP文件
+                # 删除ZIP文件
                 os.remove(zip_filepath)
             
             # 添加延迟避免请求过于频繁
-            time.sleep(0.1)
+            time.sleep(self.delay)
         
         print(f"成功下载并处理了 {successful_downloads} 个文件")
         
         if not all_dataframes:
-            print("错误: 没有成功下载任何数据")
+            print("没有成功下载任何数据")
             return None
         
         # 合并所有数据
@@ -231,22 +263,20 @@ class BTCDataDownloader:
         merged_df = pd.concat(all_dataframes, ignore_index=True)
         
         # 按时间排序
-        merged_df['DateTime_sort'] = pd.to_datetime(merged_df['DateTime'])
-        merged_df = merged_df.sort_values('DateTime_sort')
-        merged_df = merged_df.drop('DateTime_sort', axis=1)
+        merged_df['DateTime'] = pd.to_datetime(merged_df['DateTime'])
+        merged_df = merged_df.sort_values('DateTime')
         
         # 去重
         merged_df = merged_df.drop_duplicates(subset=['DateTime'])
         
-        # 保存合并后的文件
-        output_filename = f"btc_1m_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}_merged.csv"
-        output_filepath = os.path.join(self.output_dir, output_filename)
+        # 保存合并后的文件到当前目录
+        output_filepath = self.output_filename
         
         merged_df.to_csv(output_filepath, index=False)
         
-        print(f"数据合并完成!")
+        print("数据合并完成!")
         print(f"总共 {len(merged_df)} 条记录")
-        print(f"时间范围: {merged_df['DateTime'].iloc[0]} 到 {merged_df['DateTime'].iloc[-1]}")
+        print(f"时间范围: {merged_df['DateTime'].min()} 到 {merged_df['DateTime'].max()}")
         print(f"输出文件: {output_filepath}")
         
         return output_filepath
@@ -254,8 +284,8 @@ class BTCDataDownloader:
     def cleanup_temp_files(self):
         """清理临时文件"""
         try:
-            import shutil
             if os.path.exists(self.temp_dir):
+                import shutil
                 shutil.rmtree(self.temp_dir)
                 print("临时文件清理完成")
         except Exception as e:
@@ -264,26 +294,44 @@ class BTCDataDownloader:
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='下载BTC历史数据')
-    parser.add_argument('--start-date', type=str, default='2024-01-01', 
-                       help='开始日期 (YYYY-MM-DD), 默认: 2024-01-01')
+    parser.add_argument('--start-date', type=str, default=None, 
+                       help=f'开始日期 (YYYY-MM-DD), 默认: {CONFIG["START_DATE"]}')
     parser.add_argument('--end-date', type=str, default=None,
-                       help='结束日期 (YYYY-MM-DD), 默认: 昨天')
-    parser.add_argument('--output-dir', type=str, default='btc_data',
-                       help='输出目录, 默认: btc_data')
+                       help=f'结束日期 (YYYY-MM-DD), 默认: {CONFIG["END_DATE"]}')
+    parser.add_argument('--output-filename', type=str, default=None,
+                       help=f'输出文件名, 默认: {CONFIG["OUTPUT_FILENAME"]}')
     
     args = parser.parse_args()
     
     try:
-        # 解析日期
-        start_date = datetime.strptime(args.start_date, '%Y-%m-%d').date()
+        # 创建配置副本，允许命令行参数覆盖
+        config = CONFIG.copy()
         
-        if args.end_date:
-            end_date = datetime.strptime(args.end_date, '%Y-%m-%d').date()
+        # 使用命令行参数或配置文件中的默认值
+        start_date_str = args.start_date or config['START_DATE']
+        end_date_str = args.end_date or config['END_DATE']
+        
+        if args.output_filename:
+            config['OUTPUT_FILENAME'] = args.output_filename
+        
+        # 解析日期
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        
+        if end_date_str:
+            end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
         else:
             end_date = None
         
+        print("=" * 60)
+        print("BTC历史数据下载器")
+        print("=" * 60)
+        print(f"开始日期: {start_date_str}")
+        print(f"结束日期: {end_date_str or '自动确定'}")
+        print(f"输出文件: {config['OUTPUT_FILENAME']}")
+        print("=" * 60)
+        
         # 创建下载器
-        downloader = BTCDataDownloader(args.output_dir)
+        downloader = BTCDataDownloader(config)
         
         # 下载并合并数据
         output_file = downloader.download_and_merge_data(start_date, end_date)
