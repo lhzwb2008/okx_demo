@@ -16,10 +16,18 @@ class BTCMicroTrendConfig:
     def __init__(self):
         # === 基础配置 ===
         self.data_path = 'btc_1m.csv'
-        self.initial_capital = 50000  # 初始资金（USDT）- 使用成功版本的参数
+        self.initial_capital = 100000  # 初始资金（USDT）- 使用成功版本的参数
         
         # === 数据配置 ===
-        self.data_limit = 30000  # 使用数据条数
+        self.data_limit = None  # 使用全部数据（设为None）或指定条数
+        
+        # === 时间范围配置 ===
+        # 可以设置为None使用默认的80/20划分，或者设置具体日期
+        self.train_start_date = '2024-01-01'    # 训练开始日期，格式: '2024-01-01'
+        self.train_end_date = '2024-01-31'      # 训练结束日期，格式: '2024-02-01'  
+        self.test_start_date = '2024-02-01'     # 测试开始日期，格式: '2024-02-01'
+        self.test_end_date = '2025-05-30'       # 测试结束日期，格式: '2024-03-01' (一个月测试)
+        self.use_date_split = True     # 是否使用日期分割（True）还是比例分割（False）
         
         # === 策略参数 ===
         self.lookback = 10      # 观察历史数据的分钟数
@@ -38,6 +46,10 @@ class BTCMicroTrendConfig:
         
         # === 输出配置 ===
         self.verbose = True                  # 是否显示详细日志
+        self.print_trades = True             # 是否打印交易详情
+        self.max_trades_to_print = 50        # 最多打印多少笔交易（None表示全部打印）
+        self.print_daily_pnl = True          # 是否打印每日盈亏
+        self.print_daily_stats = True        # 是否打印每日交易统计（交易次数、多空单）
 
 class BTCMicroTrendBacktest:
     """BTC微趋势交易回测系统（可配置版，保持原有成功逻辑）"""
@@ -62,10 +74,14 @@ class BTCMicroTrendBacktest:
         self.df['DateTime'] = pd.to_datetime(self.df['DateTime'])
         self.df.set_index('DateTime', inplace=True)
         
-        # 只使用最近的数据以加快处理速度
-        self.df = self.df.tail(self.config.data_limit)
-        if self.config.verbose:
-            print(f"数据预处理完成，使用最近 {len(self.df)} 条记录")
+        # 根据配置决定使用多少数据
+        if self.config.data_limit is not None:
+            self.df = self.df.tail(self.config.data_limit)
+            if self.config.verbose:
+                print(f"数据预处理完成，使用最近 {len(self.df)} 条记录")
+        else:
+            if self.config.verbose:
+                print(f"数据预处理完成，使用全部 {len(self.df)} 条记录")
         
     def calculate_features(self):
         """计算技术特征"""
@@ -156,19 +172,61 @@ class BTCMicroTrendBacktest:
         X = np.array(X)
         y = np.array(y)
         
+        # 获取对应的时间索引
+        all_dates = self.df.index[self.lookback:]
+        
         # 划分训练集和测试集
-        split_idx = int(len(X) * 0.8)
-        self.X_train, self.X_test = X[:split_idx], X[split_idx:]
-        self.y_train, self.y_test = y[:split_idx], y[split_idx:]
+        if self.config.use_date_split and all([
+            self.config.train_start_date, self.config.train_end_date,
+            self.config.test_start_date, self.config.test_end_date
+        ]):
+            # 使用日期分割
+            train_start = pd.to_datetime(self.config.train_start_date)
+            train_end = pd.to_datetime(self.config.train_end_date)
+            test_start = pd.to_datetime(self.config.test_start_date)
+            test_end = pd.to_datetime(self.config.test_end_date)
+            
+            # 找到对应的索引
+            train_mask = (all_dates >= train_start) & (all_dates <= train_end)
+            test_mask = (all_dates >= test_start) & (all_dates <= test_end)
+            
+            train_indices = np.where(train_mask)[0]
+            test_indices = np.where(test_mask)[0]
+            
+            if len(train_indices) == 0 or len(test_indices) == 0:
+                if self.config.verbose:
+                    print(f"  - 警告：指定的日期范围内没有数据，回退到80/20划分")
+                # 回退到比例划分
+                split_idx = int(len(X) * 0.8)
+                self.X_train, self.X_test = X[:split_idx], X[split_idx:]
+                self.y_train, self.y_test = y[:split_idx], y[split_idx:]
+                self.test_dates = all_dates[split_idx:]
+            else:
+                self.X_train, self.X_test = X[train_indices], X[test_indices]
+                self.y_train, self.y_test = y[train_indices], y[test_indices]
+                self.test_dates = all_dates[test_indices]
+                
+                if self.config.verbose:
+                    print(f"  - 使用日期分割:")
+                    print(f"    训练期间: {train_start.date()} 到 {train_end.date()} ({len(train_indices)} 个样本)")
+                    print(f"    测试期间: {test_start.date()} 到 {test_end.date()} ({len(test_indices)} 个样本)")
+        else:
+            # 使用默认的80/20比例划分
+            split_idx = int(len(X) * 0.8)
+            self.X_train, self.X_test = X[:split_idx], X[split_idx:]
+            self.y_train, self.y_test = y[:split_idx], y[split_idx:]
+            self.test_dates = all_dates[split_idx:]
+            
+            if self.config.verbose:
+                print(f"  - 使用80/20比例划分:")
+                print(f"    训练期间: {all_dates[0].date()} 到 {all_dates[split_idx-1].date()}")
+                print(f"    测试期间: {all_dates[split_idx].date()} 到 {all_dates[-1].date()}")
         
         # 标准化特征
         if self.config.verbose:
             print("  - 标准化特征...")
         self.X_train = self.scaler.fit_transform(self.X_train)
         self.X_test = self.scaler.transform(self.X_test)
-        
-        # 保存对应的时间索引
-        self.test_dates = self.df.index[self.lookback + split_idx:]
         
         if self.config.verbose:
             print(f"训练集大小: {self.X_train.shape}, 测试集大小: {self.X_test.shape}")
@@ -250,39 +308,108 @@ class BTCMicroTrendBacktest:
         if self.config.verbose:
             print(f"生成信号统计: 买入信号 {buy_signals} 个, 卖出信号 {sell_signals} 个")
         
-        # 计算收益（保持原有逻辑）
+        # 计算收益（修正为全仓买入卖出逻辑）
         actual_returns = self.y_test
-        position = 0
-        portfolio_value = 1.0
+        position = 0  # 0=空仓, 1=满仓
+        portfolio_value = self.config.initial_capital  # 使用实际初始资金
         portfolio_values = []
         trades = []
         daily_returns = []
+        daily_pnl = {}  # 每日盈亏统计
+        daily_trades = {}  # 每日交易次数统计
+        daily_long_short = {}  # 每日多空单统计
+        
+        if self.config.verbose:
+            print(f"开始交易模拟...")
         
         for i in range(len(signals)):
-            daily_return = 0
+            current_date = self.test_dates[i].date()
+            current_price = self.df['Close'].loc[self.test_dates[i]]
             
-            if signals[i] == 1 and position == 0:  # 买入
+            if signals[i] == 1 and position == 0:  # 买入信号且当前空仓
                 position = 1
-                trades.append(('买入', self.test_dates[i], predictions[i]))
-            elif signals[i] == -1 and position == 1:  # 卖出
+                buy_price = current_price
+                # 计算买入份额（全仓买入）
+                shares = portfolio_value / buy_price
+                trades.append(('买入', self.test_dates[i], buy_price, predictions[i], shares, portfolio_value))
+                
+                # 统计每日交易次数和多空单
+                if current_date not in daily_trades:
+                    daily_trades[current_date] = 0
+                if current_date not in daily_long_short:
+                    daily_long_short[current_date] = {'long': 0, 'short': 0}
+                daily_trades[current_date] += 1
+                daily_long_short[current_date]['long'] += 1
+                    
+            elif signals[i] == -1 and position == 1:  # 卖出信号且当前满仓
                 position = 0
-                daily_return = actual_returns[i]
-                portfolio_value *= (1 + actual_returns[i])
-                trades.append(('卖出', self.test_dates[i], actual_returns[i]))
-            elif position == 1:  # 持仓
-                daily_return = actual_returns[i]
-                portfolio_value *= (1 + actual_returns[i])
+                sell_price = current_price
+                # 找到对应的买入交易
+                last_buy = None
+                for trade in reversed(trades):
+                    if trade[0] == '买入':
+                        last_buy = trade
+                        break
+                
+                if last_buy:
+                    buy_price = last_buy[2]
+                    shares = last_buy[4]
+                    buy_value = last_buy[5]
+                    
+                    # 计算卖出价值和盈亏
+                    sell_value = shares * sell_price
+                    pnl = sell_value - buy_value
+                    pnl_percent = (sell_value / buy_value - 1) * 100
+                    
+                    # 更新投资组合价值
+                    portfolio_value = sell_value
+                    
+                    trades.append(('卖出', self.test_dates[i], sell_price, pnl_percent/100, shares, sell_value, pnl))
+                    
+                    # 记录每日盈亏
+                    if current_date not in daily_pnl:
+                        daily_pnl[current_date] = 0
+                    daily_pnl[current_date] += pnl
+                    
+                    # 统计每日交易次数和多空单
+                    if current_date not in daily_trades:
+                        daily_trades[current_date] = 0
+                    if current_date not in daily_long_short:
+                        daily_long_short[current_date] = {'long': 0, 'short': 0}
+                    daily_trades[current_date] += 1
+                    daily_long_short[current_date]['short'] += 1
             
             portfolio_values.append(portfolio_value)
-            daily_returns.append(daily_return)
+            
+        # 如果最后还持有仓位，按最后价格计算
+        if position == 1:
+            last_price = self.df['Close'].loc[self.test_dates[-1]]
+            last_buy = None
+            for trade in reversed(trades):
+                if trade[0] == '买入':
+                    last_buy = trade
+                    break
+            if last_buy:
+                shares = last_buy[4]
+                portfolio_value = shares * last_price
         
         # 计算策略表现
-        total_return = (portfolio_value - 1) * 100
+        total_return = (portfolio_value / self.config.initial_capital - 1) * 100
         
         # 计算买入持有收益
         test_start_idx = self.df.index.get_loc(self.test_dates[0])
         test_end_idx = self.df.index.get_loc(self.test_dates[-1])
         buy_hold_return = (self.df['Close'].iloc[test_end_idx] / self.df['Close'].iloc[test_start_idx] - 1) * 100
+        
+        # 计算每日收益率
+        daily_returns = []
+        prev_value = self.config.initial_capital
+        for value in portfolio_values:
+            if prev_value > 0:
+                daily_returns.append((value / prev_value - 1))
+            else:
+                daily_returns.append(0)
+            prev_value = value
         
         # 计算夏普比率（分钟级别）
         returns_series = pd.Series(daily_returns)
@@ -297,17 +424,94 @@ class BTCMicroTrendBacktest:
         drawdown = (cumulative - running_max) / running_max
         max_drawdown = drawdown.min() * 100
         
-        # 计算胜率
-        winning_trades = [t for t in trades if t[0] == '卖出' and t[2] > 0]
-        losing_trades = [t for t in trades if t[0] == '卖出' and t[2] <= 0]
-        total_trades = len(winning_trades) + len(losing_trades)
+        # 计算胜率（基于卖出交易的收益）
+        sell_trades = [t for t in trades if t[0] == '卖出']
+        winning_trades = [t for t in sell_trades if len(t) > 6 and t[6] > 0]  # t[6]是盈亏金额
+        losing_trades = [t for t in sell_trades if len(t) > 6 and t[6] <= 0]
+        total_trades = len(sell_trades)
         win_rate = len(winning_trades) / total_trades * 100 if total_trades > 0 else 0
+        
+        # 统计买入和卖出数量
+        buy_trades = [t for t in trades if t[0] == '买入']
+        
+        # 计算总的多空单数量
+        total_long = sum(daily_ls.get('long', 0) for daily_ls in daily_long_short.values())
+        total_short = sum(daily_ls.get('short', 0) for daily_ls in daily_long_short.values())
+        
+        if self.config.verbose:
+            print(f"交易统计: 买入 {len(buy_trades)} 次, 卖出 {len(sell_trades)} 次")
+            print(f"多空统计: 多单 {total_long} 次, 空单 {total_short} 次")
+            
+            # 打印交易详情
+            if self.config.print_trades and len(trades) > 0:
+                print(f"\n=== 详细交易记录 ===")
+                
+                # 确定要打印多少笔交易
+                trades_to_show = len(sell_trades)  # 以完整交易对数为准
+                if self.config.max_trades_to_print is not None:
+                    trades_to_show = min(trades_to_show, self.config.max_trades_to_print)
+                
+                print(f"显示前 {trades_to_show} 笔完整交易（总共 {len(sell_trades)} 笔）：")
+                
+                current_position = 0
+                printed_trades = 0
+                
+                for i, trade in enumerate(trades):
+                    if printed_trades >= trades_to_show:
+                        break
+                        
+                    if trade[0] == '买入':
+                        current_position += 1
+                        print(f"第{current_position}笔交易:")
+                        print(f"  买入: {trade[1].strftime('%Y-%m-%d %H:%M')} 价格: ${trade[2]:.2f} 预测收益: {trade[3]*100:.3f}%")
+                        print(f"       份额: {trade[4]:.6f} 投入金额: ${trade[5]:.2f}")
+                    elif trade[0] == '卖出':
+                        actual_return = trade[3] * 100
+                        profit_loss = "盈利" if trade[3] > 0 else "亏损"
+                        pnl_amount = trade[6]  # 盈亏金额
+                        shares = trade[4]      # 份额
+                        sell_value = trade[5]  # 卖出总价值
+                        print(f"  卖出: {trade[1].strftime('%Y-%m-%d %H:%M')} 价格: ${trade[2]:.2f} 实际收益: {actual_return:.3f}% ({profit_loss})")
+                        print(f"       份额: {shares:.6f} 卖出金额: ${sell_value:.2f} 盈亏: ${pnl_amount:+.2f}")
+                        print(f"") # 空行分隔每笔完整交易
+                        printed_trades += 1
+                
+                if len(sell_trades) > trades_to_show:
+                    print(f"... 还有 {len(sell_trades) - trades_to_show} 笔交易未显示")
+                    print(f"如需查看全部交易，请设置 config.max_trades_to_print = None")
+            
+            # 打印每日交易统计
+            if self.config.print_daily_stats and (daily_pnl or daily_trades):
+                print(f"\n=== 每日交易统计 ===")
+                total_pnl = 0
+                total_trades_count = 0
+                total_long = 0
+                total_short = 0
+                
+                # 获取所有有交易的日期
+                all_trade_dates = set(daily_pnl.keys()) | set(daily_trades.keys())
+                
+                for date in sorted(all_trade_dates):
+                    daily_amount = daily_pnl.get(date, 0)
+                    daily_trade_count = daily_trades.get(date, 0)
+                    daily_ls = daily_long_short.get(date, {'long': 0, 'short': 0})
+                    
+                    total_pnl += daily_amount
+                    total_trades_count += daily_trade_count
+                    total_long += daily_ls['long']
+                    total_short += daily_ls['short']
+                    
+                    print(f"{date}: 交易{daily_trade_count:2d}次 (多{daily_ls['long']:2d}/空{daily_ls['short']:2d}) "
+                          f"盈亏${daily_amount:+8.2f} (累计${total_pnl:+10.2f})")
+                
+                print(f"\n总计: 交易{total_trades_count}次 (多单{total_long}次/空单{total_short}次) 总盈亏${total_pnl:+.2f}")
+                print(f"日均交易: {total_trades_count/len(all_trade_dates):.1f}次/天")
         
         # 打印回测结果
         if self.config.verbose:
             print("\n=== 回测结果 ===")
             print(f"初始资金: ${self.config.initial_capital:,.2f}")
-            print(f"最终资金: ${self.config.initial_capital * portfolio_value:,.2f}")
+            print(f"最终资金: ${portfolio_value:,.2f}")
             print(f"策略总收益: {total_return:.2f}%")
             print(f"买入持有收益: {buy_hold_return:.2f}%")
             print(f"超额收益: {total_return - buy_hold_return:.2f}%")
@@ -363,15 +567,17 @@ class BTCMicroTrendBacktest:
         axes[3].plot(self.test_dates, test_prices, label='BTC价格', color='black', linewidth=1)
         
         # 标记买卖点
-        buy_dates = [t[1] for t in trades if t[0] == '买入']
-        sell_dates = [t[1] for t in trades if t[0] == '卖出']
+        buy_trades = [t for t in trades if t[0] == '买入']
+        sell_trades = [t for t in trades if t[0] == '卖出']
         
-        if buy_dates:
-            buy_prices = self.df['Close'].loc[buy_dates]
+        if buy_trades:
+            buy_dates = [t[1] for t in buy_trades]
+            buy_prices = [t[2] for t in buy_trades]  # t[2]是买入价格
             axes[3].scatter(buy_dates, buy_prices, color='green', marker='^', s=100, label='买入', zorder=5)
         
-        if sell_dates:
-            sell_prices = self.df['Close'].loc[sell_dates]
+        if sell_trades:
+            sell_dates = [t[1] for t in sell_trades]
+            sell_prices = [t[2] for t in sell_trades]  # t[2]是卖出价格
             axes[3].scatter(sell_dates, sell_prices, color='red', marker='v', s=100, label='卖出', zorder=5)
         
         axes[3].set_title('BTC价格和交易信号', fontsize=14)
@@ -413,6 +619,15 @@ def get_parameter_suggestions():
     • initial_capital: 10000-100000 (初始资金)
     • data_limit: 20000-50000 (数据量，影响训练时间)
     
+    === 时间范围配置 ===
+    • use_date_split: True/False (是否使用日期分割)
+    • 日期分割模式 (use_date_split=True):
+      - train_start_date: '2024-01-01' (训练开始日期)
+      - train_end_date: '2024-02-15' (训练结束日期)
+      - test_start_date: '2024-02-16' (测试开始日期)
+      - test_end_date: '2024-03-01' (测试结束日期)
+    • 比例分割模式 (use_date_split=False): 自动80/20划分
+    
     === 策略参数 ===
     • lookback: 5-20 (观察历史时间窗口)
       - 5-10: 短期反应快，噪音多
@@ -442,15 +657,40 @@ def get_parameter_suggestions():
     """
 
 
+def create_date_split_config():
+    """创建使用日期分割的配置示例"""
+    config = BTCMicroTrendConfig()
+    
+    # 启用日期分割
+    config.use_date_split = True
+    
+    # 设置训练和测试的时间范围（需要根据实际数据调整）
+    config.train_start_date = '2024-01-01'  # 训练开始日期
+    config.train_end_date = '2024-02-15'    # 训练结束日期
+    config.test_start_date = '2024-02-16'   # 测试开始日期  
+    config.test_end_date = '2024-03-01'     # 测试结束日期
+    
+    return config
+
+
 if __name__ == "__main__":
     print(get_parameter_suggestions())
     
-    # 使用默认配置（应该能复现之前8.59%的成功结果）
+    # 直接使用配置类的设置（会读取你在配置类中的设置）
     config = BTCMicroTrendConfig()
     
-    print(f"\n当前配置:")
+    if config.use_date_split:
+        print(f"\n使用日期分割配置:")
+        print(f"  - 训练期间: {config.train_start_date} 到 {config.train_end_date}")
+        print(f"  - 测试期间: {config.test_start_date} 到 {config.test_end_date}")
+    else:
+        print(f"\n使用默认配置（80/20比例划分）:")
+    
     print(f"  - 初始资金: ${config.initial_capital:,}")
-    print(f"  - 数据量: {config.data_limit:,} 条")
+    if config.data_limit is not None:
+        print(f"  - 数据量: {config.data_limit:,} 条")
+    else:
+        print(f"  - 数据量: 全部数据")
     print(f"  - 观察窗口: {config.lookback} 分钟")
     print(f"  - 预测时间: {config.predict_ahead} 分钟")
     print(f"  - 买入阈值: {config.buy_threshold_percentile}%")
