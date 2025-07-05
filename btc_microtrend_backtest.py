@@ -34,8 +34,8 @@ class BTCMicroTrendConfig:
         self.predict_ahead = 10  # 预测未来多少分钟
         
         # === 交易参数 ===
-        self.buy_threshold_percentile = 75   # 买入信号阈值（百分位数）
-        self.sell_threshold_percentile = 25  # 卖出信号阈值（百分位数）
+        self.buy_threshold_percentile = 95   # 买入信号阈值（百分位数）
+        self.sell_threshold_percentile = 5  # 卖出信号阈值（百分位数）
         self.trading_fee_rate = 0.0005       # 交易费用率（0.05%）
         
         # === 模型参数 ===
