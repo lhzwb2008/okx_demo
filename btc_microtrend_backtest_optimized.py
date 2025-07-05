@@ -29,28 +29,38 @@ class BTCMicroTrendConfig:
         self.test_end_date = '2024-02-29'       # 测试结束日期，格式: '2024-03-01' (一个月测试)
         self.use_date_split = True     # 是否使用日期分割（True）还是比例分割（False）
         
-        # === 策略参数 ===
-        self.lookback = 10      # 观察历史数据的分钟数
-        self.predict_ahead = 10  # 预测未来多少分钟
+        # === 策略参数（优化后）===
+        self.lookback = 30              # 增加观察窗口，获取更多历史信息
+        self.predict_ahead = 10         # 保持10分钟预测
         
-        # === 交易参数 ===
-        self.buy_threshold_percentile = 75   # 买入信号阈值（百分位数）
-        self.sell_threshold_percentile = 25  # 卖出信号阈值（百分位数）
-        self.trading_fee_rate = 0.0005       # 交易费用率（0.05%）
+        # === 交易参数（简化版）===
+        self.buy_threshold_percentile = 80   # 买入阈值
+        self.sell_threshold_percentile = 20   # 卖出阈值
         
-        # === 模型参数 ===
-        self.n_estimators = 30               # 随机森林树的数量
-        self.max_depth = 10                  # 最大深度
-        self.min_samples_split = 20          # 内部节点再划分所需最小样本数
-        self.min_samples_leaf = 10           # 叶子节点最少样本数
+        # === 风险管理参数（简化版）===
+        # 不使用止损和超时平仓，保持简单的开平仓逻辑
+        
+        # === 合约交易费用参数（欧易OKX）===
+        self.enable_futures_trading = True   # 启用合约交易模式
+        self.taker_fee_rate = 0.0005        # 吃单手续费率 0.05%
+        self.funding_rate = 0.0001          # 资金费率 0.01%（每8小时）
+        self.funding_interval_hours = 8     # 资金费率收取间隔（小时）
+        
+        # === 模型参数（优化后）===
+        self.n_estimators = 50              # 增加树的数量，提高预测准确性
+        self.max_depth = 10                  # 增加深度，捕捉更复杂的模式
+        self.min_samples_split = 50          # 增加分割要求，减少过拟合
+        self.min_samples_leaf = 20           # 增加叶子节点要求，提高泛化能力
         self.random_state = 42               # 随机种子
         
         # === 输出配置 ===
-        self.verbose = True                  # 是否显示详细日志
-        self.print_trades = True             # 是否打印交易详情
-        self.max_trades_to_print = 50        # 最多打印多少笔交易（None表示全部打印）
-        self.print_daily_pnl = True          # 是否打印每日盈亏
-        self.print_daily_stats = True        # 是否打印每日交易统计（交易次数、多空单）
+        self.verbose = True                  # 开启详细日志
+        self.print_trades = True             # 开启交易详情
+        self.max_trades_to_print = 50        # 打印前50笔交易
+        self.print_daily_pnl = False         # 关闭每日盈亏
+        self.print_daily_stats = False       # 关闭每日交易统计
+        self.print_fee_details = True        # 开启费用明细
+        self.print_win_rate_only = False     # 显示完整信息
 
 class BTCMicroTrendBacktest:
     """BTC微趋势交易回测系统（可配置版，保持原有成功逻辑）"""
@@ -301,8 +311,12 @@ class BTCMicroTrendBacktest:
             print(f"  - 卖出阈值: {sell_threshold:.6f} ({sell_threshold*100:.3f}%)")
         
         signals = np.zeros_like(predictions)
-        signals[predictions > buy_threshold] = 1  # 买入信号
-        signals[predictions < sell_threshold] = -1  # 卖出信号
+        # 简化的交易信号
+        strong_buy = predictions > buy_threshold
+        strong_sell = predictions < sell_threshold
+        
+        signals[strong_buy] = 1  # 买入信号
+        signals[strong_sell] = -1  # 卖出信号
         
         buy_signals = np.sum(signals == 1)
         sell_signals = np.sum(signals == -1)
@@ -311,7 +325,7 @@ class BTCMicroTrendBacktest:
         
         # 计算收益（修正为全仓买入卖出逻辑）
         actual_returns = self.y_test
-        position = 0  # 0=空仓, 1=满仓
+        position = 0  # -1=空仓, 0=无仓, 1=多仓
         portfolio_value = self.config.initial_capital  # 使用实际初始资金
         portfolio_values = []
         trades = []
@@ -320,6 +334,20 @@ class BTCMicroTrendBacktest:
         daily_trades = {}  # 每日交易次数统计
         daily_long_short = {}  # 每日多空单统计
         
+        # 记录持仓信息
+        entry_price = 0
+        entry_shares = 0
+        entry_value = 0
+        entry_type = None  # 'long' 或 'short'
+        entry_time_idx = 0  # 记录入场时间索引
+        
+        # 费用统计
+        total_trading_fees = 0  # 总交易手续费
+        total_funding_fees = 0  # 总资金费
+        daily_trading_fees = {}  # 每日交易手续费
+        daily_funding_fees = {}  # 每日资金费
+        actual_funding_fees_paid = 0  # 实际支付的资金费
+        
         if self.config.verbose:
             print(f"开始交易模拟...")
         
@@ -327,19 +355,30 @@ class BTCMicroTrendBacktest:
             current_date = self.test_dates[i].date()
             current_price = self.df['Close'].loc[self.test_dates[i]]
             
-            if signals[i] == 1 and position == 0:  # 买入信号且当前空仓
-                position = 1
-                buy_price = current_price
-                # 计算买入手续费
-                buy_fee = portfolio_value * self.config.trading_fee_rate
-                # 计算买入份额（扣除手续费后全仓买入）
-                available_for_buy = portfolio_value - buy_fee
-                shares = available_for_buy / buy_price
-                # 更新投资组合价值（扣除手续费）
-                portfolio_value = available_for_buy
-                trades.append(('买入', self.test_dates[i], buy_price, predictions[i], shares, portfolio_value, buy_fee))
+            # 简化版：不使用止损和超时平仓，只根据信号开平仓
+            
+            # 多头开仓：买入信号且当前无仓
+            if signals[i] == 1 and position == 0:
+                # 计算开仓手续费
+                if self.config.enable_futures_trading:
+                    trading_fee = portfolio_value * self.config.taker_fee_rate
+                    portfolio_value -= trading_fee  # 扣除手续费
+                    total_trading_fees += trading_fee
+                    
+                    if current_date not in daily_trading_fees:
+                        daily_trading_fees[current_date] = 0
+                    daily_trading_fees[current_date] += trading_fee
                 
-                # 统计每日交易次数和多空单
+                position = 1
+                entry_price = current_price
+                entry_value = portfolio_value
+                entry_shares = portfolio_value / current_price  # 买入份额
+                entry_type = 'long'
+                entry_time_idx = i  # 记录入场时间
+                
+                trades.append(('开多', self.test_dates[i], entry_price, predictions[i], entry_shares, entry_value, 0, trading_fee if self.config.enable_futures_trading else 0))
+                
+                # 统计每日交易
                 if current_date not in daily_trades:
                     daily_trades[current_date] = 0
                 if current_date not in daily_long_short:
@@ -347,64 +386,195 @@ class BTCMicroTrendBacktest:
                 daily_trades[current_date] += 1
                 daily_long_short[current_date]['long'] += 1
                     
-            elif signals[i] == -1 and position == 1:  # 卖出信号且当前满仓
-                position = 0
-                sell_price = current_price
-                # 找到对应的买入交易
-                last_buy = None
-                for trade in reversed(trades):
-                    if trade[0] == '买入':
-                        last_buy = trade
-                        break
+            # 空头开仓：卖出信号且当前无仓
+            elif signals[i] == -1 and position == 0:
+                # 计算开仓手续费
+                if self.config.enable_futures_trading:
+                    trading_fee = portfolio_value * self.config.taker_fee_rate
+                    portfolio_value -= trading_fee  # 扣除手续费
+                    total_trading_fees += trading_fee
+                    
+                    if current_date not in daily_trading_fees:
+                        daily_trading_fees[current_date] = 0
+                    daily_trading_fees[current_date] += trading_fee
                 
-                if last_buy:
-                    buy_price = last_buy[2]
-                    shares = last_buy[4]
-                    buy_value = last_buy[5]
-                    buy_fee = last_buy[6]  # 买入手续费
+                position = -1
+                entry_price = current_price
+                entry_value = portfolio_value
+                entry_shares = portfolio_value / current_price  # 做空份额
+                entry_type = 'short'
+                entry_time_idx = i  # 记录入场时间
+                
+                trades.append(('开空', self.test_dates[i], entry_price, predictions[i], entry_shares, entry_value, 0, trading_fee if self.config.enable_futures_trading else 0))
+                
+                # 统计每日交易
+                if current_date not in daily_trades:
+                    daily_trades[current_date] = 0
+                if current_date not in daily_long_short:
+                    daily_long_short[current_date] = {'long': 0, 'short': 0}
+                daily_trades[current_date] += 1
+                daily_long_short[current_date]['short'] += 1
+                
+            # 多头平仓：卖出信号且当前持多仓
+            elif signals[i] == -1 and position == 1:
+                # 计算多头收益
+                exit_value = entry_shares * current_price
+                
+                # 计算平仓手续费
+                if self.config.enable_futures_trading:
+                    trading_fee = exit_value * self.config.taker_fee_rate
+                    exit_value -= trading_fee  # 扣除手续费
+                    total_trading_fees += trading_fee
                     
-                    # 计算卖出价值和卖出手续费
-                    gross_sell_value = shares * sell_price
-                    sell_fee = gross_sell_value * self.config.trading_fee_rate
-                    net_sell_value = gross_sell_value - sell_fee
+                    if current_date not in daily_trading_fees:
+                        daily_trading_fees[current_date] = 0
+                    daily_trading_fees[current_date] += trading_fee
+                
+                pnl = exit_value - entry_value
+                pnl_percent = (exit_value / entry_value - 1) * 100
+                
+                # 更新投资组合价值
+                portfolio_value = exit_value
+                
+                trades.append(('平多', self.test_dates[i], current_price, pnl_percent/100, entry_shares, exit_value, pnl, trading_fee if self.config.enable_futures_trading else 0))
+                
+                # 记录每日盈亏
+                if current_date not in daily_pnl:
+                    daily_pnl[current_date] = 0
+                daily_pnl[current_date] += pnl
+                
+                # 重置仓位
+                position = 0
+                entry_price = 0
+                entry_shares = 0
+                entry_value = 0
+                entry_type = None
+                
+            # 空头平仓：买入信号且当前持空仓
+            elif signals[i] == 1 and position == -1:
+                # 计算空头收益（价格下跌时盈利）
+                price_change_ratio = current_price / entry_price
+                exit_value = entry_value * (2 - price_change_ratio)  # 空头收益计算
+                
+                # 计算平仓手续费
+                if self.config.enable_futures_trading:
+                    trading_fee = exit_value * self.config.taker_fee_rate
+                    exit_value -= trading_fee  # 扣除手续费
+                    total_trading_fees += trading_fee
                     
-                    # 计算总盈亏（包含买入和卖出手续费）
-                    # 原始投入金额（买入前的资金）
-                    original_investment = buy_value + buy_fee
-                    total_pnl = net_sell_value - original_investment
-                    pnl_percent = (net_sell_value / original_investment - 1) * 100
-                    
-                    # 更新投资组合价值（扣除卖出手续费）
-                    portfolio_value = net_sell_value
-                    
-                    trades.append(('卖出', self.test_dates[i], sell_price, pnl_percent/100, shares, net_sell_value, total_pnl, sell_fee))
-                    
-                    # 记录每日盈亏
-                    if current_date not in daily_pnl:
-                        daily_pnl[current_date] = 0
-                    daily_pnl[current_date] += total_pnl
-                    
-                    # 统计每日交易次数和多空单
-                    if current_date not in daily_trades:
-                        daily_trades[current_date] = 0
-                    if current_date not in daily_long_short:
-                        daily_long_short[current_date] = {'long': 0, 'short': 0}
-                    daily_trades[current_date] += 1
-                    daily_long_short[current_date]['short'] += 1
+                    if current_date not in daily_trading_fees:
+                        daily_trading_fees[current_date] = 0
+                    daily_trading_fees[current_date] += trading_fee
+                
+                pnl = exit_value - entry_value
+                pnl_percent = (exit_value / entry_value - 1) * 100
+                
+                # 更新投资组合价值
+                portfolio_value = exit_value
+                
+                trades.append(('平空', self.test_dates[i], current_price, pnl_percent/100, entry_shares, exit_value, pnl, trading_fee if self.config.enable_futures_trading else 0))
+                
+                # 记录每日盈亏
+                if current_date not in daily_pnl:
+                    daily_pnl[current_date] = 0
+                daily_pnl[current_date] += pnl
+                
+                # 重置仓位
+                position = 0
+                entry_price = 0
+                entry_shares = 0
+                entry_value = 0
+                entry_type = None
+            
+            # 计算资金费（如果持仓）
+            if self.config.enable_futures_trading and position != 0:
+                # 计算实际持仓时间（分钟）
+                holding_minutes = i - entry_time_idx
+                
+                # 检查是否跨过资金费收取时间点（每8小时）
+                # 获取入场和当前时间
+                entry_time = self.test_dates[entry_time_idx]
+                current_time = self.test_dates[i]
+                
+                # 计算跨过的8小时时间点数量
+                entry_hour = entry_time.hour
+                current_hour = current_time.hour
+                days_diff = (current_time.date() - entry_time.date()).days
+                
+                # 资金费收取时间点：0:00, 8:00, 16:00 (UTC+8)
+                funding_times = [0, 8, 16]
+                
+                # 计算是否刚好跨过资金费时间点
+                for funding_hour in funding_times:
+                    # 检查是否在这一分钟刚好跨过资金费时间
+                    if i > entry_time_idx:
+                        prev_time = self.test_dates[i-1]
+                        if prev_time.hour < funding_hour <= current_hour or (days_diff > 0 and current_hour == funding_hour and current_time.minute == 0):
+                            # 计算资金费
+                            funding_fee = portfolio_value * self.config.funding_rate
+                            
+                            # 多头支付资金费，空头收取资金费（假设资金费率为正）
+                            if position == 1:
+                                portfolio_value -= funding_fee
+                                total_funding_fees += funding_fee
+                                actual_funding_fees_paid += funding_fee
+                            else:  # position == -1
+                                portfolio_value += funding_fee
+                                total_funding_fees -= funding_fee
+                                actual_funding_fees_paid -= funding_fee
+                            
+                            if current_date not in daily_funding_fees:
+                                daily_funding_fees[current_date] = 0
+                            daily_funding_fees[current_date] += funding_fee if position == 1 else -funding_fee
             
             portfolio_values.append(portfolio_value)
             
-        # 如果最后还持有仓位，按最后价格计算
-        if position == 1:
+        # 如果最后还持有仓位，按最后价格平仓
+        if position != 0:
             last_price = self.df['Close'].loc[self.test_dates[-1]]
-            last_buy = None
-            for trade in reversed(trades):
-                if trade[0] == '买入':
-                    last_buy = trade
-                    break
-            if last_buy:
-                shares = last_buy[4]
-                portfolio_value = shares * last_price
+            last_date = self.test_dates[-1].date()
+            
+            if position == 1:  # 持有多仓
+                exit_value = entry_shares * last_price
+                
+                # 计算平仓手续费
+                if self.config.enable_futures_trading:
+                    trading_fee = exit_value * self.config.taker_fee_rate
+                    exit_value -= trading_fee
+                    total_trading_fees += trading_fee
+                    
+                    if last_date not in daily_trading_fees:
+                        daily_trading_fees[last_date] = 0
+                    daily_trading_fees[last_date] += trading_fee
+                
+                pnl = exit_value - entry_value
+                pnl_percent = (exit_value / entry_value - 1) * 100
+                portfolio_value = exit_value
+                trades.append(('平多(结束)', self.test_dates[-1], last_price, pnl_percent/100, entry_shares, exit_value, pnl, trading_fee if self.config.enable_futures_trading else 0))
+                
+            elif position == -1:  # 持有空仓
+                price_change_ratio = last_price / entry_price
+                exit_value = entry_value * (2 - price_change_ratio)
+                
+                # 计算平仓手续费
+                if self.config.enable_futures_trading:
+                    trading_fee = exit_value * self.config.taker_fee_rate
+                    exit_value -= trading_fee
+                    total_trading_fees += trading_fee
+                    
+                    if last_date not in daily_trading_fees:
+                        daily_trading_fees[last_date] = 0
+                    daily_trading_fees[last_date] += trading_fee
+                
+                pnl = exit_value - entry_value
+                pnl_percent = (exit_value / entry_value - 1) * 100
+                portfolio_value = exit_value
+                trades.append(('平空(结束)', self.test_dates[-1], last_price, pnl_percent/100, entry_shares, exit_value, pnl, trading_fee if self.config.enable_futures_trading else 0))
+            
+            # 记录最后的盈亏
+            if last_date not in daily_pnl:
+                daily_pnl[last_date] = 0
+            daily_pnl[last_date] += pnl
         
         # 计算策略表现
         total_return = (portfolio_value / self.config.initial_capital - 1) * 100
@@ -437,40 +607,26 @@ class BTCMicroTrendBacktest:
         drawdown = (cumulative - running_max) / running_max
         max_drawdown = drawdown.min() * 100
         
-        # 计算胜率（基于卖出交易的收益）
-        sell_trades = [t for t in trades if t[0] == '卖出']
-        winning_trades = [t for t in sell_trades if len(t) > 6 and t[6] > 0]  # t[6]是盈亏金额
-        losing_trades = [t for t in sell_trades if len(t) > 6 and t[6] <= 0]
-        total_trades = len(sell_trades)
+        # 计算胜率（基于平仓交易的收益）
+        close_trades = [t for t in trades if t[0] in ['平多', '平空', '平多(结束)', '平空(结束)']]
+        winning_trades = [t for t in close_trades if len(t) > 6 and t[6] > 0]  # t[6]是盈亏金额
+        losing_trades = [t for t in close_trades if len(t) > 6 and t[6] <= 0]
+        total_trades = len(close_trades)
         win_rate = len(winning_trades) / total_trades * 100 if total_trades > 0 else 0
         
-        # 计算盈亏比（平均盈利/平均亏损）
-        if len(winning_trades) > 0 and len(losing_trades) > 0:
-            avg_profit = sum(t[6] for t in winning_trades) / len(winning_trades)
-            avg_loss = abs(sum(t[6] for t in losing_trades) / len(losing_trades))
-            profit_loss_ratio = avg_profit / avg_loss if avg_loss > 0 else 0
-        else:
-            avg_profit = sum(t[6] for t in winning_trades) / len(winning_trades) if len(winning_trades) > 0 else 0
-            avg_loss = abs(sum(t[6] for t in losing_trades) / len(losing_trades)) if len(losing_trades) > 0 else 0
-            profit_loss_ratio = 0
-        
-        # 计算总手续费
-        total_fees = 0
-        for trade in trades:
-            if trade[0] == '买入' and len(trade) > 6:
-                total_fees += trade[6]  # 买入手续费
-            elif trade[0] == '卖出' and len(trade) > 7:
-                total_fees += trade[7]  # 卖出手续费
-        
-        # 统计买入和卖出数量
-        buy_trades = [t for t in trades if t[0] == '买入']
+        # 统计开仓和平仓数量
+        long_open_trades = [t for t in trades if t[0] == '开多']
+        short_open_trades = [t for t in trades if t[0] == '开空']
+        long_close_trades = [t for t in trades if t[0] in ['平多', '平多(结束)']]
+        short_close_trades = [t for t in trades if t[0] in ['平空', '平空(结束)']]
         
         # 计算总的多空单数量
         total_long = sum(daily_ls.get('long', 0) for daily_ls in daily_long_short.values())
         total_short = sum(daily_ls.get('short', 0) for daily_ls in daily_long_short.values())
         
         if self.config.verbose:
-            print(f"交易统计: 买入 {len(buy_trades)} 次, 卖出 {len(sell_trades)} 次")
+            print(f"交易统计: 开多 {len(long_open_trades)} 次, 开空 {len(short_open_trades)} 次")
+            print(f"平仓统计: 平多 {len(long_close_trades)} 次, 平空 {len(short_close_trades)} 次")
             print(f"多空统计: 多单 {total_long} 次, 空单 {total_short} 次")
             
             # 打印交易详情
@@ -478,11 +634,11 @@ class BTCMicroTrendBacktest:
                 print(f"\n=== 详细交易记录 ===")
                 
                 # 确定要打印多少笔交易
-                trades_to_show = len(sell_trades)  # 以完整交易对数为准
+                trades_to_show = len(close_trades)  # 以完整交易对数为准
                 if self.config.max_trades_to_print is not None:
                     trades_to_show = min(trades_to_show, self.config.max_trades_to_print)
                 
-                print(f"显示前 {trades_to_show} 笔完整交易（总共 {len(sell_trades)} 笔）：")
+                print(f"显示前 {trades_to_show} 笔完整交易（总共 {len(close_trades)} 笔）：")
                 
                 current_position = 0
                 printed_trades = 0
@@ -491,26 +647,56 @@ class BTCMicroTrendBacktest:
                     if printed_trades >= trades_to_show:
                         break
                         
-                    if trade[0] == '买入':
+                    if trade[0] in ['开多', '开空']:
                         current_position += 1
-                        print(f"第{current_position}笔交易:")
-                        buy_fee = trade[6] if len(trade) > 6 else 0
-                        print(f"  买入: {trade[1].strftime('%Y-%m-%d %H:%M')} 价格: ${trade[2]:.2f} 预测收益: {trade[3]*100:.3f}%")
-                        print(f"       份额: {trade[4]:.6f} 投入金额: ${trade[5]:.2f} 手续费: ${buy_fee:.2f}")
-                    elif trade[0] == '卖出':
+                        trade_type = "多单" if trade[0] == '开多' else "空单"
+                        print(f"第{current_position}笔交易 ({trade_type}):")
+                        print(f"  📈 {trade[0]}: {trade[1].strftime('%Y-%m-%d %H:%M')} 价格: ${trade[2]:.2f} 预测收益: {trade[3]*100:.3f}%")
+                        print(f"       💰 投入金额: ${trade[5]:.2f} | 交易量: {trade[4]:.6f} BTC")
+                        if self.config.enable_futures_trading and len(trade) > 7:
+                            print(f"       💸 开仓手续费: ${trade[7]:.2f} ({trade[7]/trade[5]*100:.3f}%)")
+                        
+                        # 存储开仓信息用于计算总费用
+                        entry_info = {
+                            'entry_price': trade[2],
+                            'entry_amount': trade[5],
+                            'entry_fee': trade[7] if self.config.enable_futures_trading and len(trade) > 7 else 0,
+                            'shares': trade[4]
+                        }
+                        
+                    elif trade[0] in ['平多', '平空', '平多(结束)', '平空(结束)']:
                         actual_return = trade[3] * 100
-                        profit_loss = "盈利" if trade[3] > 0 else "亏损"
+                        profit_loss = "🟢 盈利" if trade[3] > 0 else "🔴 亏损"
                         pnl_amount = trade[6]  # 盈亏金额
                         shares = trade[4]      # 份额
-                        sell_value = trade[5]  # 卖出总价值
-                        sell_fee = trade[7] if len(trade) > 7 else 0
-                        print(f"  卖出: {trade[1].strftime('%Y-%m-%d %H:%M')} 价格: ${trade[2]:.2f} 实际收益: {actual_return:.3f}% ({profit_loss})")
-                        print(f"       份额: {shares:.6f} 卖出金额: ${sell_value:.2f} 手续费: ${sell_fee:.2f} 净盈亏: ${pnl_amount:+.2f}")
+                        exit_value = trade[5]  # 平仓总价值
+                        exit_price = trade[2]  # 平仓价格
+                        
+                        # 计算总手续费
+                        exit_fee = trade[7] if self.config.enable_futures_trading and len(trade) > 7 else 0
+                        total_fees = entry_info.get('entry_fee', 0) + exit_fee
+                        
+                        # 计算价格变化
+                        price_change = (exit_price - entry_info.get('entry_price', 0)) / entry_info.get('entry_price', 1) * 100
+                        
+                        print(f"  📉 {trade[0]}: {trade[1].strftime('%Y-%m-%d %H:%M')} 价格: ${exit_price:.2f} 实际收益: {actual_return:.3f}% ({profit_loss})")
+                        print(f"       💰 平仓金额: ${exit_value:.2f} | 交易量: {shares:.6f} BTC")
+                        print(f"       📊 价格变化: {price_change:+.3f}% | 盈亏: ${pnl_amount:+.2f}")
+                        
+                        if self.config.enable_futures_trading:
+                            print(f"       💸 平仓手续费: ${exit_fee:.2f} ({exit_fee/exit_value*100:.3f}%)")
+                            print(f"       💸 总手续费: ${total_fees:.2f} | 净收益: ${pnl_amount:+.2f}")
+                            
+                        # 计算收益率统计
+                        gross_return = (exit_value + entry_info.get('entry_fee', 0) + exit_fee) / entry_info.get('entry_amount', 1) - 1
+                        net_return = pnl_amount / entry_info.get('entry_amount', 1)
+                        
+                        print(f"       📈 毛收益率: {gross_return*100:+.3f}% | 净收益率: {net_return*100:+.3f}%")
                         print(f"") # 空行分隔每笔完整交易
                         printed_trades += 1
                 
-                if len(sell_trades) > trades_to_show:
-                    print(f"... 还有 {len(sell_trades) - trades_to_show} 笔交易未显示")
+                if len(close_trades) > trades_to_show:
+                    print(f"... 还有 {len(close_trades) - trades_to_show} 笔交易未显示")
                     print(f"如需查看全部交易，请设置 config.max_trades_to_print = None")
             
             # 打印每日交易统计
@@ -534,33 +720,51 @@ class BTCMicroTrendBacktest:
                     total_long += daily_ls['long']
                     total_short += daily_ls['short']
                     
-                    print(f"{date}: 交易{daily_trade_count:2d}次 (多{daily_ls['long']:2d}/空{daily_ls['short']:2d}) "
-                          f"盈亏${daily_amount:+8.2f} (累计${total_pnl:+10.2f})")
+                    output_str = f"{date}: 交易{daily_trade_count:2d}次 (多{daily_ls['long']:2d}/空{daily_ls['short']:2d}) "
+                    output_str += f"盈亏${daily_amount:+8.2f} (累计${total_pnl:+10.2f})"
+                    
+                    # 添加每日费用信息
+                    if self.config.enable_futures_trading:
+                        daily_tfee = daily_trading_fees.get(date, 0)
+                        daily_ffee = daily_funding_fees.get(date, 0)
+                        if daily_tfee > 0 or daily_ffee != 0:
+                            output_str += f" | 手续费${daily_tfee:.2f} 资金费${daily_ffee:+.2f}"
+                    
+                    print(output_str)
                 
                 print(f"\n总计: 交易{total_trades_count}次 (多单{total_long}次/空单{total_short}次) 总盈亏${total_pnl:+.2f}")
                 print(f"日均交易: {total_trades_count/len(all_trade_dates):.1f}次/天")
         
-        # 打印回测结果
-        if self.config.verbose:
+        # 只打印胜率相关信息
+        if hasattr(self.config, 'print_win_rate_only') and self.config.print_win_rate_only:
+            print(f"胜率: {win_rate:.2f}% | 交易次数: {total_trades} | 净收益: {total_return:.2f}%")
+        elif self.config.verbose:
             print("\n=== 回测结果 ===")
             print(f"初始资金: ${self.config.initial_capital:,.2f}")
             print(f"最终资金: ${portfolio_value:,.2f}")
             print(f"策略总收益: {total_return:.2f}%")
             print(f"买入持有收益: {buy_hold_return:.2f}%")
             print(f"超额收益: {total_return - buy_hold_return:.2f}%")
-            print(f"交易费用率: {self.config.trading_fee_rate*100:.2f}%")
-            print(f"总手续费: ${total_fees:.2f}")
-            print(f"手续费占初始资金比例: {total_fees/self.config.initial_capital*100:.2f}%")
             print(f"夏普比率: {sharpe_ratio:.2f}")
             print(f"最大回撤: {max_drawdown:.2f}%")
             print(f"总交易次数: {total_trades}")
             print(f"胜率: {win_rate:.2f}%")
-            print(f"盈亏比: {profit_loss_ratio:.2f}")
-            if len(winning_trades) > 0:
-                print(f"平均盈利: ${avg_profit:.2f}")
-            if len(losing_trades) > 0:
-                print(f"平均亏损: ${avg_loss:.2f}")
             print(f"预测准确率: {np.mean(np.sign(predictions) == np.sign(actual_returns)) * 100:.2f}%")
+            
+            # 打印费用明细
+            if self.config.enable_futures_trading and self.config.print_fee_details:
+                print("\n=== 费用明细（欧易合约）===")
+                print(f"吃单费率: {self.config.taker_fee_rate*100:.3f}%")
+                print(f"资金费率: {self.config.funding_rate*100:.3f}% (每{self.config.funding_interval_hours}小时)")
+                print(f"总交易手续费: ${total_trading_fees:,.2f} ({total_trading_fees/self.config.initial_capital*100:.2f}%)")
+                print(f"总资金费: ${total_funding_fees:,.2f} ({total_funding_fees/self.config.initial_capital*100:.2f}%)")
+                print(f"总费用: ${total_trading_fees + total_funding_fees:,.2f} ({(total_trading_fees + total_funding_fees)/self.config.initial_capital*100:.2f}%)")
+                
+                # 计算净收益
+                gross_pnl = portfolio_value - self.config.initial_capital + total_trading_fees + total_funding_fees
+                net_pnl = portfolio_value - self.config.initial_capital
+                print(f"\n毛利润(未扣费): ${gross_pnl:,.2f} ({gross_pnl/self.config.initial_capital*100:.2f}%)")
+                print(f"净利润(已扣费): ${net_pnl:,.2f} ({net_pnl/self.config.initial_capital*100:.2f}%)")
         
         # 绘制回测结果
         self.plot_backtest_results(portfolio_values, predictions, actual_returns, trades)
@@ -571,11 +775,7 @@ class BTCMicroTrendBacktest:
             'sharpe_ratio': sharpe_ratio,
             'max_drawdown': max_drawdown,
             'trades': trades,
-            'win_rate': win_rate,
-            'profit_loss_ratio': profit_loss_ratio,
-            'avg_profit': avg_profit if len(winning_trades) > 0 else 0,
-            'avg_loss': avg_loss if len(losing_trades) > 0 else 0,
-            'total_fees': total_fees
+            'win_rate': win_rate
         }
     
     def plot_backtest_results(self, portfolio_values, predictions, actual_returns, trades):
@@ -611,19 +811,31 @@ class BTCMicroTrendBacktest:
         test_prices = self.df['Close'].loc[self.test_dates]
         axes[3].plot(self.test_dates, test_prices, label='BTC价格', color='black', linewidth=1)
         
-        # 标记买卖点
-        buy_trades = [t for t in trades if t[0] == '买入']
-        sell_trades = [t for t in trades if t[0] == '卖出']
+        # 标记开仓和平仓点
+        long_open = [t for t in trades if t[0] == '开多']
+        short_open = [t for t in trades if t[0] == '开空']
+        long_close = [t for t in trades if t[0] in ['平多', '平多(结束)']]
+        short_close = [t for t in trades if t[0] in ['平空', '平空(结束)']]
         
-        if buy_trades:
-            buy_dates = [t[1] for t in buy_trades]
-            buy_prices = [t[2] for t in buy_trades]  # t[2]是买入价格
-            axes[3].scatter(buy_dates, buy_prices, color='green', marker='^', s=100, label='买入', zorder=5)
+        if long_open:
+            dates = [t[1] for t in long_open]
+            prices = [t[2] for t in long_open]
+            axes[3].scatter(dates, prices, color='green', marker='^', s=100, label='开多', zorder=5)
         
-        if sell_trades:
-            sell_dates = [t[1] for t in sell_trades]
-            sell_prices = [t[2] for t in sell_trades]  # t[2]是卖出价格
-            axes[3].scatter(sell_dates, sell_prices, color='red', marker='v', s=100, label='卖出', zorder=5)
+        if short_open:
+            dates = [t[1] for t in short_open]
+            prices = [t[2] for t in short_open]
+            axes[3].scatter(dates, prices, color='red', marker='v', s=100, label='开空', zorder=5)
+            
+        if long_close:
+            dates = [t[1] for t in long_close]
+            prices = [t[2] for t in long_close]
+            axes[3].scatter(dates, prices, color='lightgreen', marker='x', s=100, label='平多', zorder=5)
+            
+        if short_close:
+            dates = [t[1] for t in short_close]
+            prices = [t[2] for t in short_close]
+            axes[3].scatter(dates, prices, color='lightcoral', marker='x', s=100, label='平空', zorder=5)
         
         axes[3].set_title('BTC价格和交易信号', fontsize=14)
         axes[3].set_ylabel('价格 (USDT)')
@@ -719,31 +931,41 @@ def create_date_split_config():
 
 
 if __name__ == "__main__":
-    print(get_parameter_suggestions())
+    # === 胜率优化参数建议 ===
+    # 可以手动调整以下参数来优化胜率：
+    # 
+    # 交易阈值（影响交易频率和质量）：
+    # - buy_threshold_percentile: 75, 80, 85, 90, 95  # 买入阈值，越高交易越少但质量越好
+    # - sell_threshold_percentile: 25, 20, 15, 10, 5   # 卖出阈值，与买入阈值对称
+    # 
+    # 已移除最小收益过滤，使用简化的交易逻辑
+    # 
+    # 观察窗口（影响预测准确性）：
+    # - lookback: 10, 15, 20, 25  # 观察历史时间窗口
+    # - predict_ahead: 10, 15, 20  # 预测未来时间
+    # 
+    # 模型参数（影响预测能力）：
+    # - n_estimators: 50, 100, 150  # 随机森林树的数量
+    # - max_depth: 10, 15, 20  # 树的最大深度
     
-    # 直接使用配置类的设置（会读取你在配置类中的设置）
+    # 创建配置并运行单次回测
     config = BTCMicroTrendConfig()
     
-    if config.use_date_split:
-        print(f"\n使用日期分割配置:")
-        print(f"  - 训练期间: {config.train_start_date} 到 {config.train_end_date}")
-        print(f"  - 测试期间: {config.test_start_date} 到 {config.test_end_date}")
-    else:
-        print(f"\n使用默认配置（80/20比例划分）:")
+    # 可以在这里手动调整参数，例如：
+    # config.buy_threshold_percentile = 85
+    # config.sell_threshold_percentile = 15
     
-    print(f"  - 初始资金: ${config.initial_capital:,}")
-    if config.data_limit is not None:
-        print(f"  - 数据量: {config.data_limit:,} 条")
-    else:
-        print(f"  - 数据量: 全部数据")
-    print(f"  - 观察窗口: {config.lookback} 分钟")
-    print(f"  - 预测时间: {config.predict_ahead} 分钟")
-    print(f"  - 买入阈值: {config.buy_threshold_percentile}%")
-    print(f"  - 卖出阈值: {config.sell_threshold_percentile}%")
-    print(f"  - 随机森林参数: n_estimators={config.n_estimators}, max_depth={config.max_depth}")
+    print("=== 当前参数配置 ===")
+    print(f"买入阈值: {config.buy_threshold_percentile}%")
+    print(f"卖出阈值: {config.sell_threshold_percentile}%")
+    print(f"观察窗口: {config.lookback}分钟")
+    print(f"预测时间: {config.predict_ahead}分钟")
+    print(f"随机森林: {config.n_estimators}棵树, 深度{config.max_depth}")
+    print(f"简化版本: 无止损、无超时平仓、无最小收益过滤")
+    print()
     
     # 运行回测
     backtest = BTCMicroTrendBacktest(config)
     results = backtest.run()
     
-    print("\n回测完成！") 
+    print("回测完成！") 
