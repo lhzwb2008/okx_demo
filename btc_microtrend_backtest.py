@@ -4,8 +4,8 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score
+import xgboost as xgb
 import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
@@ -23,34 +23,66 @@ class BTCMicroTrendConfig:
         
         # === 时间范围配置 ===
         # 可以设置为None使用默认的80/20划分，或者设置具体日期
-        self.train_start_date = '2024-01-01'    # 训练开始日期，格式: '2024-01-01'
-        self.train_end_date = '2024-01-31'      # 训练结束日期，格式: '2024-02-01'  
-        self.test_start_date = '2024-02-01'     # 测试开始日期，格式: '2024-02-01'
-        self.test_end_date = '2024-02-29'       # 测试结束日期，格式: '2024-03-01' (一个月测试)
+        self.train_start_date = '2024-02-01'    # 训练开始日期，格式: '2024-01-01'
+        self.train_end_date = '2024-02-28'      # 训练结束日期，格式: '2024-02-01'  
+        self.test_start_date = '2024-03-01'     # 测试开始日期，格式: '2024-02-01'
+        self.test_end_date = '2024-03-30'       # 测试结束日期，格式: '2024-03-01' (一个月测试)
         self.use_date_split = True     # 是否使用日期分割（True）还是比例分割（False）
         
         # === 策略参数 ===
         self.lookback = 10      # 观察历史数据的分钟数
         self.predict_ahead = 10  # 预测未来多少分钟
         
+        # 新增：固定持仓时间策略选项
+        self.use_fixed_holding_time = True   # 是否使用固定持仓时间策略（默认开启）
+        self.fixed_holding_minutes = 10      # 固定持仓时间（分钟）
+        
         # === 交易参数 ===
-        self.buy_threshold_percentile = 95   # 买入信号阈值（百分位数）
-        self.sell_threshold_percentile = 5  # 卖出信号阈值（百分位数）
-        self.trading_fee_rate = 0.0005       # 交易费用率（0.05%）
+        self.buy_threshold_percentile = 80   # 买入信号阈值（百分位数）- 固定持仓策略降低阈值
+        self.sell_threshold_percentile = 20  # 卖出信号阈值（百分位数）- 固定持仓策略中不使用
+        self.trading_fee_rate = 0           # 交易费用率（暂时设为0）
         
         # === 模型参数 ===
-        self.n_estimators = 30               # 随机森林树的数量
-        self.max_depth = 10                  # 最大深度
-        self.min_samples_split = 20          # 内部节点再划分所需最小样本数
-        self.min_samples_leaf = 10           # 叶子节点最少样本数
-        self.random_state = 42               # 随机种子
+        # 基础参数
+        self.n_estimators = 20             # 树的数量 - 控制模型复杂度
+        # 建议：金融数据10-50较好，过多容易过拟合
+        
+        self.max_depth = 5                 # 树的最大深度 - 控制单棵树的复杂度  
+        # 建议：3-6较好，过深容易过拟合
+        
+        self.learning_rate = 0.3           # 学习率 - 控制每棵树的贡献
+        # 建议：0.01-0.3，越小越保守但需要更多树
+        
+        # 采样参数 - 防止过拟合
+        self.subsample = 0.9               # 样本采样比例 - 每棵树使用多少比例的样本
+        # 建议：0.6-0.9，降低可减少过拟合
+        
+        self.colsample_bytree = 0.9        # 特征采样比例 - 每棵树使用多少比例的特征
+        # 建议：0.6-0.9，降低可减少过拟合和提高泛化
+        
+        # 分裂控制参数
+        self.gamma = 0                     # 分裂所需的最小损失减少 - 控制分裂的保守程度
+        # 建议：0-0.5，越大越保守，减少过拟合
+        
+        self.min_child_weight = 0.5        # 子节点最小权重 - 控制叶子节点的最小样本权重
+        # 建议：1-10，越大越保守
+        
+        # 正则化参数
+        self.reg_alpha = 0                 # L1正则化 - 特征选择，产生稀疏模型
+        # 建议：0-1，增加可减少特征数量
+        
+        self.reg_lambda = 0.1              # L2正则化 - 权重平滑，防止过拟合
+        # 建议：0.1-10，增加可减少过拟合
+        
+        self.random_state = 42             # 随机种子 - 保证结果可重复
         
         # === 输出配置 ===
         self.verbose = True                  # 是否显示详细日志
-        self.print_trades = True             # 是否打印交易详情
+        self.print_trades = False             # 是否打印交易详情
         self.max_trades_to_print = 50        # 最多打印多少笔交易（None表示全部打印）
-        self.print_daily_pnl = True          # 是否打印每日盈亏
-        self.print_daily_stats = True        # 是否打印每日交易统计（交易次数、多空单）
+        self.print_daily_pnl = False          # 是否打印每日盈亏
+        self.print_daily_stats = False        # 是否打印每日交易统计（交易次数、多空单）
+
 
 class BTCMicroTrendBacktest:
     """BTC微趋势交易回测系统（可配置版，保持原有成功逻辑）"""
@@ -241,19 +273,25 @@ class BTCMicroTrendBacktest:
             print(f"  - 最大值: {np.max(y):.6f}")
         
     def train_model(self):
-        """训练随机森林模型"""
+        """训练XGBoost模型"""
         if self.config.verbose:
-            print("开始训练随机森林模型...")
+            print("开始训练XGBoost模型...")
             print(f"  - 使用 {self.X_train.shape[0]} 个训练样本，{self.X_train.shape[1]} 个特征")
         
         # 使用配置的模型参数
-        self.model = RandomForestRegressor(
+        self.model = xgb.XGBRegressor(
             n_estimators=self.config.n_estimators,
             max_depth=self.config.max_depth,
-            min_samples_split=self.config.min_samples_split,
-            min_samples_leaf=self.config.min_samples_leaf,
+            learning_rate=self.config.learning_rate,
+            subsample=self.config.subsample,
+            colsample_bytree=self.config.colsample_bytree,
+            gamma=self.config.gamma,
+            reg_alpha=self.config.reg_alpha,
+            reg_lambda=self.config.reg_lambda,
+            min_child_weight=self.config.min_child_weight,
             random_state=self.config.random_state,
-            n_jobs=-1
+            n_jobs=-1,
+            verbosity=0  # 减少输出
         )
         
         if self.config.verbose:
@@ -297,8 +335,18 @@ class BTCMicroTrendBacktest:
         
         if self.config.verbose:
             print(f"动态交易阈值:")
-            print(f"  - 买入阈值: {buy_threshold:.6f} ({buy_threshold*100:.3f}%)")
-            print(f"  - 卖出阈值: {sell_threshold:.6f} ({sell_threshold*100:.3f}%)")
+            print(f"  - 买入阈值 ({self.config.buy_threshold_percentile}%分位数): {buy_threshold:.6f} ({buy_threshold*100:.3f}%)")
+            print(f"  - 卖出阈值 ({self.config.sell_threshold_percentile}%分位数): {sell_threshold:.6f} ({sell_threshold*100:.3f}%)")
+            
+            # 添加更详细的预测值分布信息
+            print(f"预测值分布详情:")
+            percentiles = [5, 10, 25, 50, 75, 90, 95]
+            for p in percentiles:
+                val = np.percentile(predictions, p)
+                print(f"  - {p}%分位数: {val:.6f} ({val*100:.3f}%)")
+            print(f"  - 非零预测值数量: {np.sum(predictions != 0)}/{len(predictions)}")
+            print(f"  - 正预测值数量: {np.sum(predictions > 0)}/{len(predictions)}")
+            print(f"  - 负预测值数量: {np.sum(predictions < 0)}/{len(predictions)}")
         
         signals = np.zeros_like(predictions)
         signals[predictions > buy_threshold] = 1  # 买入信号
@@ -323,61 +371,43 @@ class BTCMicroTrendBacktest:
         if self.config.verbose:
             print(f"开始交易模拟...")
         
-        for i in range(len(signals)):
-            current_date = self.test_dates[i].date()
-            current_price = self.df['Close'].loc[self.test_dates[i]]
+        # 如果使用固定持仓时间策略
+        if self.config.use_fixed_holding_time:
+            # 固定持仓时间策略
+            open_positions = []  # 存储开仓信息：(开仓时间索引, 开仓价格, 方向, 份额, 投入金额, 手续费)
             
-            if signals[i] == 1 and position == 0:  # 买入信号且当前空仓
-                position = 1
-                buy_price = current_price
-                # 计算买入手续费
-                buy_fee = portfolio_value * self.config.trading_fee_rate
-                # 计算买入份额（扣除手续费后全仓买入）
-                available_for_buy = portfolio_value - buy_fee
-                shares = available_for_buy / buy_price
-                # 更新投资组合价值（扣除手续费）
-                portfolio_value = available_for_buy
-                trades.append(('买入', self.test_dates[i], buy_price, predictions[i], shares, portfolio_value, buy_fee))
+            for i in range(len(signals)):
+                current_date = self.test_dates[i].date()
+                current_price = self.df['Close'].loc[self.test_dates[i]]
                 
-                # 统计每日交易次数和多空单
-                if current_date not in daily_trades:
-                    daily_trades[current_date] = 0
-                if current_date not in daily_long_short:
-                    daily_long_short[current_date] = {'long': 0, 'short': 0}
-                daily_trades[current_date] += 1
-                daily_long_short[current_date]['long'] += 1
-                    
-            elif signals[i] == -1 and position == 1:  # 卖出信号且当前满仓
-                position = 0
-                sell_price = current_price
-                # 找到对应的买入交易
-                last_buy = None
-                for trade in reversed(trades):
-                    if trade[0] == '买入':
-                        last_buy = trade
-                        break
+                # 检查是否有到期需要平仓的仓位
+                positions_to_close = []
+                for pos_idx, (open_idx, open_price, direction, shares, investment, open_fee) in enumerate(open_positions):
+                    # 检查是否到达固定持仓时间
+                    if i - open_idx >= self.config.fixed_holding_minutes:
+                        positions_to_close.append(pos_idx)
                 
-                if last_buy:
-                    buy_price = last_buy[2]
-                    shares = last_buy[4]
-                    buy_value = last_buy[5]
-                    buy_fee = last_buy[6]  # 买入手续费
+                # 平仓到期仓位
+                for pos_idx in reversed(positions_to_close):  # 从后往前删除避免索引问题
+                    open_idx, open_price, direction, shares, investment, open_fee = open_positions[pos_idx]
                     
                     # 计算卖出价值和卖出手续费
-                    gross_sell_value = shares * sell_price
+                    gross_sell_value = shares * current_price
                     sell_fee = gross_sell_value * self.config.trading_fee_rate
                     net_sell_value = gross_sell_value - sell_fee
                     
-                    # 计算总盈亏（包含买入和卖出手续费）
-                    # 原始投入金额（买入前的资金）
-                    original_investment = buy_value + buy_fee
-                    total_pnl = net_sell_value - original_investment
-                    pnl_percent = (net_sell_value / original_investment - 1) * 100
+                    # 计算总盈亏
+                    if direction == 1:  # 多头
+                        total_pnl = net_sell_value - investment
+                    else:  # 空头（虽然当前策略不支持，但预留）
+                        total_pnl = investment - net_sell_value
                     
-                    # 更新投资组合价值（扣除卖出手续费）
+                    pnl_percent = total_pnl / investment
+                    
+                    # 更新投资组合价值
                     portfolio_value = net_sell_value
                     
-                    trades.append(('卖出', self.test_dates[i], sell_price, pnl_percent/100, shares, net_sell_value, total_pnl, sell_fee))
+                    trades.append(('卖出', self.test_dates[i], current_price, pnl_percent, shares, net_sell_value, total_pnl, sell_fee))
                     
                     # 记录每日盈亏
                     if current_date not in daily_pnl:
@@ -391,8 +421,128 @@ class BTCMicroTrendBacktest:
                         daily_long_short[current_date] = {'long': 0, 'short': 0}
                     daily_trades[current_date] += 1
                     daily_long_short[current_date]['short'] += 1
+                    
+                    # 移除已平仓的仓位
+                    open_positions.pop(pos_idx)
+                
+                # 检查新的开仓信号（只有在没有仓位时才开仓，保持单一仓位）
+                if signals[i] == 1 and len(open_positions) == 0:  # 买入信号且当前无仓位
+                    # 计算买入手续费
+                    buy_fee = portfolio_value * self.config.trading_fee_rate
+                    # 计算买入份额（扣除手续费后全仓买入）
+                    available_for_buy = portfolio_value - buy_fee
+                    shares = available_for_buy / current_price
+                    # 更新投资组合价值（扣除手续费）
+                    portfolio_value = available_for_buy
+                    
+                    trades.append(('买入', self.test_dates[i], current_price, predictions[i], shares, portfolio_value, buy_fee))
+                    
+                    # 添加到开仓列表
+                    open_positions.append((i, current_price, 1, shares, available_for_buy, buy_fee))
+                    
+                    # 统计每日交易次数和多空单
+                    if current_date not in daily_trades:
+                        daily_trades[current_date] = 0
+                    if current_date not in daily_long_short:
+                        daily_long_short[current_date] = {'long': 0, 'short': 0}
+                    daily_trades[current_date] += 1
+                    daily_long_short[current_date]['long'] += 1
+                
+                portfolio_values.append(portfolio_value)
             
-            portfolio_values.append(portfolio_value)
+            # 处理最后剩余的未平仓仓位
+            for open_idx, open_price, direction, shares, investment, open_fee in open_positions:
+                current_price = self.df['Close'].loc[self.test_dates[-1]]
+                
+                # 计算卖出价值和卖出手续费
+                gross_sell_value = shares * current_price
+                sell_fee = gross_sell_value * self.config.trading_fee_rate
+                net_sell_value = gross_sell_value - sell_fee
+                
+                # 计算总盈亏
+                if direction == 1:  # 多头
+                    total_pnl = net_sell_value - investment
+                else:  # 空头
+                    total_pnl = investment - net_sell_value
+                
+                pnl_percent = total_pnl / investment
+                
+                # 更新投资组合价值
+                portfolio_value = net_sell_value
+                
+                trades.append(('卖出', self.test_dates[-1], current_price, pnl_percent, shares, net_sell_value, total_pnl, sell_fee))
+        else:
+            # 原有的信号驱动策略
+            for i in range(len(signals)):
+                current_date = self.test_dates[i].date()
+                current_price = self.df['Close'].loc[self.test_dates[i]]
+                
+                if signals[i] == 1 and position == 0:  # 买入信号且当前空仓
+                    position = 1
+                    buy_price = current_price
+                    # 计算买入手续费
+                    buy_fee = portfolio_value * self.config.trading_fee_rate
+                    # 计算买入份额（扣除手续费后全仓买入）
+                    available_for_buy = portfolio_value - buy_fee
+                    shares = available_for_buy / buy_price
+                    # 更新投资组合价值（扣除手续费）
+                    portfolio_value = available_for_buy
+                    trades.append(('买入', self.test_dates[i], buy_price, predictions[i], shares, portfolio_value, buy_fee))
+                    
+                    # 统计每日交易次数和多空单
+                    if current_date not in daily_trades:
+                        daily_trades[current_date] = 0
+                    if current_date not in daily_long_short:
+                        daily_long_short[current_date] = {'long': 0, 'short': 0}
+                    daily_trades[current_date] += 1
+                    daily_long_short[current_date]['long'] += 1
+                        
+                elif signals[i] == -1 and position == 1:  # 卖出信号且当前满仓
+                    position = 0
+                    sell_price = current_price
+                    # 找到对应的买入交易
+                    last_buy = None
+                    for trade in reversed(trades):
+                        if trade[0] == '买入':
+                            last_buy = trade
+                            break
+                    
+                    if last_buy:
+                        buy_price = last_buy[2]
+                        shares = last_buy[4]
+                        buy_value = last_buy[5]
+                        buy_fee = last_buy[6]  # 买入手续费
+                        
+                        # 计算卖出价值和卖出手续费
+                        gross_sell_value = shares * sell_price
+                        sell_fee = gross_sell_value * self.config.trading_fee_rate
+                        net_sell_value = gross_sell_value - sell_fee
+                        
+                        # 计算总盈亏（包含买入和卖出手续费）
+                        # 原始投入金额（买入前的资金）
+                        original_investment = buy_value + buy_fee
+                        total_pnl = net_sell_value - original_investment
+                        pnl_percent = (net_sell_value / original_investment - 1) * 100
+                        
+                        # 更新投资组合价值（扣除卖出手续费）
+                        portfolio_value = net_sell_value
+                        
+                        trades.append(('卖出', self.test_dates[i], sell_price, pnl_percent/100, shares, net_sell_value, total_pnl, sell_fee))
+                        
+                        # 记录每日盈亏
+                        if current_date not in daily_pnl:
+                            daily_pnl[current_date] = 0
+                        daily_pnl[current_date] += total_pnl
+                        
+                        # 统计每日交易次数和多空单
+                        if current_date not in daily_trades:
+                            daily_trades[current_date] = 0
+                        if current_date not in daily_long_short:
+                            daily_long_short[current_date] = {'long': 0, 'short': 0}
+                        daily_trades[current_date] += 1
+                        daily_long_short[current_date]['short'] += 1
+                
+                portfolio_values.append(portfolio_value)
             
         # 如果最后还持有仓位，按最后价格计算
         if position == 1:
@@ -655,51 +805,7 @@ class BTCMicroTrendBacktest:
         return results
 
 
-def get_parameter_suggestions():
-    """获取参数调优建议"""
-    return """
-    🎯 参数调优建议：
-    
-    === 基础参数 ===
-    • initial_capital: 10000-100000 (初始资金)
-    • data_limit: 20000-50000 (数据量，影响训练时间)
-    
-    === 时间范围配置 ===
-    • use_date_split: True/False (是否使用日期分割)
-    • 日期分割模式 (use_date_split=True):
-      - train_start_date: '2024-01-01' (训练开始日期)
-      - train_end_date: '2024-02-15' (训练结束日期)
-      - test_start_date: '2024-02-16' (测试开始日期)
-      - test_end_date: '2024-03-01' (测试结束日期)
-    • 比例分割模式 (use_date_split=False): 自动80/20划分
-    
-    === 策略参数 ===
-    • lookback: 5-20 (观察历史时间窗口)
-      - 5-10: 短期反应快，噪音多
-      - 10-15: 平衡选择
-      - 15-20: 稳定但滞后
-    
-    • predict_ahead: 5-20 (预测未来时间)
-      - 与lookback保持相近或相等
-    
-    === 交易阈值 ===
-    • buy_threshold_percentile: 70-85 (买入阈值)
-    • sell_threshold_percentile: 15-30 (卖出阈值)
-      - 阈值差距大: 交易少但质量高
-      - 阈值差距小: 交易多但噪音大
-    
-    === 模型参数 ===
-    • n_estimators: 20-100 (树的数量)
-    • max_depth: 8-20 (最大深度)
-    • min_samples_split: 10-30
-    • min_samples_leaf: 5-15
-    
-    === 优化建议 ===
-    1. 保持原有成功的特征工程
-    2. 重点调整交易阈值
-    3. 适度调整模型复杂度
-    4. 关注夏普比率和回撤平衡
-    """
+
 
 
 def create_date_split_config():
@@ -711,39 +817,193 @@ def create_date_split_config():
     
     # 设置训练和测试的时间范围（需要根据实际数据调整）
     config.train_start_date = '2024-01-01'  # 训练开始日期
-    config.train_end_date = '2024-02-15'    # 训练结束日期
-    config.test_start_date = '2024-02-16'   # 测试开始日期  
-    config.test_end_date = '2024-03-01'     # 测试结束日期
+    config.train_end_date = '2024-02-01'    # 训练结束日期
+    config.test_start_date = '2024-02-02'   # 测试开始日期  
+    config.test_end_date = '2025-03-01'     # 测试结束日期
     
     return config
 
 
-if __name__ == "__main__":
-    print(get_parameter_suggestions())
+def xgboost_parameter_tuning_guide():
+    """XGBoost参数调优指南"""
+    print("=" * 60)
+    print("XGBoost参数调优指南 - 针对金融时间序列")
+    print("=" * 60)
     
-    # 直接使用配置类的设置（会读取你在配置类中的设置）
+    print("\n🎯 调优策略：")
+    print("1. 先调基础参数（n_estimators, max_depth, learning_rate）")
+    print("2. 再调采样参数（subsample, colsample_bytree）")
+    print("3. 最后调正则化参数（gamma, reg_alpha, reg_lambda）")
+    
+    print("\n📊 参数详解：")
+    
+    print("\n【基础参数】")
+    print("n_estimators (树的数量):")
+    print("  - 作用：控制模型复杂度")
+    print("  - 金融数据建议：10-50")
+    print("  - 调优：从小开始，逐步增加，观察验证集性能")
+    print("  - 过多的风险：过拟合，训练时间长")
+    
+    print("\nmax_depth (树的深度):")
+    print("  - 作用：控制单棵树的复杂度")
+    print("  - 金融数据建议：3-6")
+    print("  - 调优：从3开始，逐步增加")
+    print("  - 过深的风险：过拟合，学习噪音")
+    
+    print("\nlearning_rate (学习率):")
+    print("  - 作用：控制每棵树的贡献权重")
+    print("  - 建议：0.01-0.3")
+    print("  - 平衡：学习率低 + 树多 vs 学习率高 + 树少")
+    print("  - 调优：可以先用0.1，然后微调")
+    
+    print("\n【采样参数 - 防过拟合】")
+    print("subsample (样本采样):")
+    print("  - 作用：每棵树使用多少比例的样本")
+    print("  - 建议：0.6-0.9")
+    print("  - 效果：降低可减少过拟合，提高泛化")
+    
+    print("\ncolsample_bytree (特征采样):")
+    print("  - 作用：每棵树使用多少比例的特征")
+    print("  - 建议：0.6-0.9")
+    print("  - 效果：增加模型多样性，减少过拟合")
+    
+    print("\n【分裂控制参数】")
+    print("gamma (分裂最小增益):")
+    print("  - 作用：节点分裂所需的最小损失减少")
+    print("  - 建议：0-0.5")
+    print("  - 效果：越大越保守，减少过拟合")
+    
+    print("\nmin_child_weight (子节点最小权重):")
+    print("  - 作用：控制叶子节点的最小样本权重")
+    print("  - 建议：1-10")
+    print("  - 效果：越大越保守，防止过拟合")
+    
+    print("\n【正则化参数】")
+    print("reg_alpha (L1正则化):")
+    print("  - 作用：特征选择，产生稀疏模型")
+    print("  - 建议：0-1")
+    print("  - 效果：增加可减少特征数量")
+    
+    print("\nreg_lambda (L2正则化):")
+    print("  - 作用：权重平滑，防止过拟合")
+    print("  - 建议：0.1-10")
+    print("  - 效果：增加可减少过拟合")
+    
+    print("\n🔧 针对你的发现的调优建议：")
+    print("既然发现简单模型效果更好，可以尝试：")
+    print("1. n_estimators: 5-20 (减少树的数量)")
+    print("2. max_depth: 2-4 (减少树的深度)")
+    print("3. learning_rate: 0.1-0.3 (保持适中)")
+    print("4. 增加正则化: reg_lambda=1-5")
+    print("5. 降低采样率: subsample=0.7, colsample_bytree=0.7")
+    
+    print("\n📈 验证方法：")
+    print("1. 观察训练集vs测试集的MSE差异")
+    print("2. 关注胜率和盈亏比的变化")
+    print("3. 检查预测值的分布是否合理")
+    print("4. 使用交叉验证来选择最优参数")
+
+def create_simple_model_config():
+    """创建简单模型配置"""
     config = BTCMicroTrendConfig()
     
-    if config.use_date_split:
-        print(f"\n使用日期分割配置:")
-        print(f"  - 训练期间: {config.train_start_date} 到 {config.train_end_date}")
-        print(f"  - 测试期间: {config.test_start_date} 到 {config.test_end_date}")
-    else:
-        print(f"\n使用默认配置（80/20比例划分）:")
+    # 使用更简单的模型参数
+    config.n_estimators = 5           # 很少的树
+    config.max_depth = 3              # 很浅的深度
+    config.learning_rate = 0.2        # 适中的学习率
+    config.subsample = 0.7            # 降低采样率
+    config.colsample_bytree = 0.7     # 降低特征采样率
+    config.gamma = 0.1                # 增加分裂限制
+    config.reg_lambda = 2             # 增加正则化
+    config.min_child_weight = 3       # 增加子节点权重限制
     
-    print(f"  - 初始资金: ${config.initial_capital:,}")
-    if config.data_limit is not None:
-        print(f"  - 数据量: {config.data_limit:,} 条")
-    else:
-        print(f"  - 数据量: 全部数据")
-    print(f"  - 观察窗口: {config.lookback} 分钟")
-    print(f"  - 预测时间: {config.predict_ahead} 分钟")
+    return config
+
+def create_conservative_model_config():
+    """创建保守模型配置"""
+    config = BTCMicroTrendConfig()
+    
+    # 保守的模型参数
+    config.n_estimators = 15          # 适中的树数量
+    config.max_depth = 2              # 非常浅的深度
+    config.learning_rate = 0.1        # 较低的学习率
+    config.subsample = 0.6            # 低采样率
+    config.colsample_bytree = 0.6     # 低特征采样率
+    config.gamma = 0.2                # 较强的分裂限制
+    config.reg_lambda = 5             # 强正则化
+    config.min_child_weight = 5       # 强子节点限制
+    
+    return config 
+
+def create_fixed_holding_time_config():
+    """创建固定持仓时间策略配置"""
+    config = BTCMicroTrendConfig()
+    
+    # 启用固定持仓时间策略
+    config.use_fixed_holding_time = True
+    config.fixed_holding_minutes = 10  # 固定持仓10分钟
+    
+    # 调整交易阈值，使其更容易触发（因为只依赖买入信号）
+    config.buy_threshold_percentile = 60  # 降低买入阈值
+    config.sell_threshold_percentile = 40  # 这个在固定持仓时间策略中不会用到
+    
+    # 使用较简单的模型
+    config.n_estimators = 10
+    config.max_depth = 4
+    config.learning_rate = 0.2
+    
+    return config
+
+def test_fixed_holding_time_strategy():
+    """测试固定持仓时间策略"""
+    print("=" * 60)
+    print("测试固定持仓时间策略")
+    print("=" * 60)
+    
+    # 创建固定持仓时间配置
+    config = create_fixed_holding_time_config()
+    
+    print(f"\n固定持仓时间策略配置:")
+    print(f"  - 固定持仓时间: {config.fixed_holding_minutes} 分钟")
     print(f"  - 买入阈值: {config.buy_threshold_percentile}%")
-    print(f"  - 卖出阈值: {config.sell_threshold_percentile}%")
-    print(f"  - 随机森林参数: n_estimators={config.n_estimators}, max_depth={config.max_depth}")
+    print(f"  - 模型参数: n_estimators={config.n_estimators}, max_depth={config.max_depth}")
     
     # 运行回测
     backtest = BTCMicroTrendBacktest(config)
     results = backtest.run()
     
-    print("\n回测完成！") 
+    print(f"\n固定持仓时间策略回测完成！")
+    print(f"在这个策略中，每次买入后都会在{config.fixed_holding_minutes}分钟后自动平仓")
+    print(f"理论上盈亏比应该更接近1:1，因为持仓时间是固定的")
+    
+    return results 
+
+if __name__ == "__main__":
+    # 直接使用固定持仓时间策略
+    config = BTCMicroTrendConfig()
+    
+    print(f"🎯 固定持仓时间策略 (开仓后{config.fixed_holding_minutes}分钟自动平仓)")
+    print("=" * 60)
+    
+    if config.use_date_split:
+        print(f"训练期间: {config.train_start_date} 到 {config.train_end_date}")
+        print(f"测试期间: {config.test_start_date} 到 {config.test_end_date}")
+    else:
+        print(f"使用默认配置（80/20比例划分）")
+    
+    print(f"初始资金: ${config.initial_capital:,}")
+    if config.data_limit is not None:
+        print(f"数据量: {config.data_limit:,} 条")
+    else:
+        print(f"数据量: 全部数据")
+    print(f"观察窗口: {config.lookback} 分钟")
+    print(f"预测时间: {config.predict_ahead} 分钟")
+    print(f"买入阈值: {config.buy_threshold_percentile}%")
+    print(f"固定持仓时间: {config.fixed_holding_minutes} 分钟")
+    print(f"XGBoost参数: n_estimators={config.n_estimators}, max_depth={config.max_depth}, learning_rate={config.learning_rate}")
+    
+    # 运行回测
+    backtest = BTCMicroTrendBacktest(config)
+    results = backtest.run()
+    
+    print("\n✅ 回测完成！") 
